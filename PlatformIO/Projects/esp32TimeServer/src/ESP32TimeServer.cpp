@@ -8,16 +8,18 @@
 // https://time.is may be used a reference point to confirm your computer's date/time accuracy
 //
 
-// board: Olimex ESP32 POE ISO
+// board: WT32-ETH01 with M8N GPS
+// GPS RX pin connected to GPIO17 on the ESP32
+// GPS TX pin connected to GPIO5 on the ESP32
+// GPS PPS pin connected to GPIO33 on the ESP32
 
 // last updated July 6, 2023
 
 #include <ETH.h>
-#include <Timezone.h> // https://github.com/khoih-prog/Timezone_Generic
+#include <Timezone.h>
 #include <ESP32Time.h>
 #include <SoftwareSerial.h>
-#include <SparkFun_u-blox_GNSS_v3.h> // https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3
-#include <LiquidCrystal_I2C.h>       // https://github.com/johnrickman/LiquidCrystal_I2C
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include "ESP32TimeServerKeySettings.h"
 
 // ESP32Time real time clock
@@ -29,13 +31,9 @@ bool eth_got_IP = false;
 String ip = "";
 
 // GPS
-SFE_UBLOX_GNSS_SERIAL gps;
-SoftwareSerial GPSDevice(RXPin, TXPin);
+SFE_UBLOX_GNSS gps;
+#define GPSDevice Serial2
 volatile bool ppsFlag; // GPS one-pulse-per-second flag
-
-// LCD Display
-LiquidCrystal_I2C lcd(lcdI2CAddress, lcdColumns, lcdRows);
-String fullyBlankLine = "";
 
 // TimeZone
 TimeChangeRule *tcr;
@@ -97,29 +95,30 @@ void setupButton()
 void display(uint8_t row, String msg, bool writeToSerialMonitor = true)
 {
 
-  String displayLine = msg + fullyBlankLine; // adding the fully blank line here clears the remnants of previously displayed information
-  displayLine = displayLine.substring(0, 20);
+  // String displayLine = msg + fullyBlankLine; // adding the fully blank line here clears the remnants of previously displayed information
+  // displayLine = displayLine.substring(0, 20);
 
-  lcd.setCursor(0, row);
-  lcd.print(displayLine);
+  // lcd.setCursor(0, row);
+  // lcd.print(displayLine);
 
-  if (debugIsOn && writeToSerialMonitor)
-    Serial.println(displayLine);
+  // if (debugIsOn && writeToSerialMonitor)
+  //   Serial.println(displayLine);
+  Serial.println(msg);
 }
 
 void setupDisplay()
 {
 
-  lcd.begin(lcdColumns, lcdRows);
-  lcd.init();
-  lcd.backlight();
-  lcd.noAutoscroll();
-  lcd.noCursor();
-  lcd.clear();
-  lcd.home();
+  // lcd.begin(lcdColumns, lcdRows);
+  // lcd.init();
+  // lcd.backlight();
+  // lcd.noAutoscroll();
+  // lcd.noCursor();
+  // lcd.clear();
+  // lcd.home();
 
-  for (int i = 0; i < lcdColumns; i++)
-    fullyBlankLine.concat(" ");
+  // for (int i = 0; i < lcdColumns; i++)
+  //   fullyBlankLine.concat(" ");
 
   display(0, "ESP32 Time Server", false);
 }
@@ -314,8 +313,6 @@ void updateTheDisplay(void *parameter)
         // centre up time results on the display
         String ws = GetUpTime();
         int padLeftSpacesNeeded = (lcdColumns - ws.length()) / 2;
-        String padLeft = fullyBlankLine.substring(0, padLeftSpacesNeeded);
-        ws = padLeft + ws;
         display(upTimeResultsRow, ws, false);
 
         display(upTimeExplainRow, " days hrs:mins:secs", false);
@@ -393,10 +390,10 @@ void startAnOngoingTaskToUpdateTheDisplayEverySecond()
 bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
 {
 
-  bool buadRateNeedsToBeSet = true;
+  bool baudRateNeedsToBeSet = true;
   int attemptsToChangeTheBaudRate = 0;
 
-  while ((buadRateNeedsToBeSet) && (attemptsToChangeTheBaudRate < maxAattemptsToChangeTheBaudRate))
+  while ((baudRateNeedsToBeSet) && (attemptsToChangeTheBaudRate < maxAattemptsToChangeTheBaudRate))
   {
 
     if (debugIsOn)
@@ -405,19 +402,21 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
       Serial.println("  Set baud rate to " + String(gpsBaud));
     }
 
-    GPSDevice.begin(gpsBaud);
+    GPSDevice.begin(gpsBaud, SERIAL_8N1, GPSPinRX, GPSPinTX);
     delay(100);
+    // gps.enableDebugging();
     if (gps.begin(GPSDevice))
     {
-      buadRateNeedsToBeSet = false;
+      gps.setNMEAOutputPort(Serial);
+      baudRateNeedsToBeSet = false;
     }
     else
     {
 
       if (debugIsOn)
-        Serial.println("  Could not connect at a buad rate of " + String(gpsBaud) + ", now trying 9600 baud");
+        Serial.println("  Could not connect at a baud rate of " + String(gpsBaud) + ", now trying 9600 baud");
 
-      GPSDevice.begin(9600);
+      GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
 
       if (gps.begin(GPSDevice))
       {
@@ -430,7 +429,7 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
       {
         if (debugIsOn)
         {
-          Serial.println("  Could not connect at a buad rate of 9600 baud");
+          Serial.println("  Could not connect at a baud rate of 9600 baud");
           if ((attemptsToChangeTheBaudRate + 1) != maxAattemptsToChangeTheBaudRate)
             Serial.println("  will try again");
         };
@@ -442,7 +441,7 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
     };
   };
 
-  //   gps.saveConfiguration();   // Optionally: if when you are testing this sketch the buad rate is constantly being
+  //   gps.saveConfiguration();   // Optionally: if when you are testing this sketch the baud rate is constantly being
   //                              // successfully set at the desired rate (38400) then you can uncomment this line of code
   //                              // so that the GPS's configuration will default to starting at 34800 rather than 9600.
   //                              // However, as this will only need to be done once this line of code should then be
@@ -451,7 +450,7 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
   if (debugIsOn)
   {
     Serial.println("");
-    if (buadRateNeedsToBeSet)
+    if (baudRateNeedsToBeSet)
     {
       Serial.println("The baud rate on the GPS could not be set to " + String(gpsBaud));
     }
@@ -462,7 +461,7 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
     Serial.println("");
   };
 
-  return !buadRateNeedsToBeSet;
+  return !baudRateNeedsToBeSet;
 };
 
 void setupGPS()
@@ -480,6 +479,7 @@ void setupGPS()
 
   gps.setI2COutput(0);
   gps.setUART1Output(COM_TYPE_UBX); // Set the UART port to output UBX only
+  // gps.setUART1Output(COM_TYPE_UBX | COM_TYPE_NMEA);
   gps.setUART2Output(0);
 
   display(1, "Waiting for GPS fix");
@@ -490,7 +490,6 @@ void setupGPS()
   bool continueWaitingForAFix = true;
   while (continueWaitingForAFix)
   {
-
     // only check once a second
     if (millis() > nextCheck)
     {
@@ -498,6 +497,7 @@ void setupGPS()
       nextCheck = millis() + oneSecond_inMilliseconds;
 
       fixType = gps.getFixType();
+      Serial.println("Fix type is " + String(fixType));
       if ((fixType > 0) && (fixType < 6))
       {
 
@@ -530,6 +530,9 @@ void setupGPS()
         continueWaitingForAFix = false;
       };
     };
+
+    gps.checkUblox();
+    delay(250);
   };
 }
 
@@ -964,8 +967,8 @@ void setup()
    mutex = xSemaphoreCreateMutex();
 
   // setup for the use of the pulse-per-second pin
-  pinMode(PPSPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PPSPin), ppsHandlerRising, RISING);
+  pinMode(GPSPinPPS, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(GPSPinPPS), ppsHandlerRising, RISING);
 
   startAnOngoingTaskToRefreshTheDateAndTimeFromTheGPS();
 
@@ -987,5 +990,6 @@ void setup()
 
 void loop()
 {
+  gps.checkUblox();
   processNTPRequests();
 }
