@@ -8,18 +8,15 @@
 // https://time.is may be used a reference point to confirm your computer's date/time accuracy
 //
 
-// board: WT32-ETH01 with M8N GPS
+// board: WT32-ETH01 with Neo6M GPS
 // GPS RX pin connected to GPIO17 on the ESP32
 // GPS TX pin connected to GPIO5 on the ESP32
 // GPS PPS pin connected to GPIO33 on the ESP32
 
-// last updated July 6, 2023
-
 #include <ETH.h>
 #include <Timezone.h>
 #include <ESP32Time.h>
-#include <SoftwareSerial.h>
-#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
+#include <TinyGPSPlus.h>
 #include "ESP32TimeServerKeySettings.h"
 
 // ESP32Time real time clock
@@ -31,7 +28,7 @@ bool eth_got_IP = false;
 String ip = "";
 
 // GPS
-SFE_UBLOX_GNSS gps;
+TinyGPSPlus gps;
 #define GPSDevice Serial2
 volatile bool ppsFlag; // GPS one-pulse-per-second flag
 
@@ -54,7 +51,7 @@ const unsigned long periodicTimeRefreshPeriod = oneMinute_inMilliseconds;       
 const time_t safeguardThresholdInSeconds = 1;                                     // used to ensure a GPS time refresh is only performed if the difference between the old and new times is this many seconds or less
 volatile bool SafeGuardTripped = false;                                           // used to ensure the time isn't changed beyond that which would reasonably be expected within the periodicTimeRefreshPeriod
                                                                                   //
-volatile bool theTimeSettingProcessIsUnderway;                                    // signifies when the time is being set / refreshed
+volatile bool didSetGPSTime;  // have we ever set time based on GPS?
 
 //
 SemaphoreHandle_t mutex;         // used to ensure an NTP request results are not impacted by the process that refreshes the time
@@ -63,33 +60,6 @@ TaskHandle_t taskHandle0 = NULL; // task handle for updating the display
 TaskHandle_t taskHandle1 = NULL; // task handle for setting/refreshing the time
 
 //**************************************************************************************************************************
-
-void setupSerial()
-{
-
-  if (debugIsOn)
-  {
-
-    Serial.begin(SerialMonitorSpeed);
-
-    for (int i = 0; i < 10; i++)
-      Serial.println("");
-  };
-}
-
-void turnOffWifiAndBluetooth()
-{
-
-  // wifi and bluetooth aren't needed so turn them off
-  WiFi.mode(WIFI_OFF);
-  btStop();
-}
-
-void setupButton()
-{
-
-  pinMode(UpTimePin, INPUT_PULLUP);
-};
 
 void display(uint8_t row, String msg, bool writeToSerialMonitor = true)
 {
@@ -103,23 +73,6 @@ void display(uint8_t row, String msg, bool writeToSerialMonitor = true)
   // if (debugIsOn && writeToSerialMonitor)
   //   Serial.println(displayLine);
   Serial.println(msg);
-}
-
-void setupDisplay()
-{
-
-  // lcd.begin(lcdColumns, lcdRows);
-  // lcd.init();
-  // lcd.backlight();
-  // lcd.noAutoscroll();
-  // lcd.noCursor();
-  // lcd.clear();
-  // lcd.home();
-
-  // for (int i = 0; i < lcdColumns; i++)
-  //   fullyBlankLine.concat(" ");
-
-  display(0, "ESP32 Time Server", false);
 }
 
 void GetAdjustedDateAndTimeStrings(time_t UTC_Time, String &dateString, String &timeString)
@@ -204,422 +157,7 @@ String GetUpTime()
   return returnValue;
 }
 
-bool checkUpTimeRequest()
-{
-
-  bool returnValue = false;
-
-  if (digitalRead(UpTimePin) == 0)
-  {
-
-    delay(10); // weed out false positives caused by debounce
-
-    if (digitalRead(UpTimePin) == 0)
-    {
-
-      returnValue = true;
-    };
-  };
-
-  return returnValue;
-}
-
-void updateTheDisplay(void *parameter)
-{
-
-  const int programNameRow = 0;   // the LCD row on which the program name will be displayed
-                                  //
-                                  // when an NTP request is not being processed:
-  const int dateRow = 1;          // the LCD row on which the current date in local time will be displayed
-  const int timeRow = 2;          // the LCD row on which the current time in local time will be displayed
-  const int ipAddressRow = 3;     // the LCD row on which the IP Address of this device will be displayed
-                                  //
-                                  // when an NTP request is being processed:
-  const int upTimeRequestRow = 1; // the LCD row on which the up time request message will be displayed
-  const int upTimeResultsRow = 2; // the LCD row on which the up time will be displayed
-  const int upTimeExplainRow = 3; // the LCD row on which a blank line will appear when displaying the up time
-
-  int previousTopLineMessage = -1;
-  int previousSecond = -1;
-
-  static int displayUpTimeSecondsCounter = 0; // used to keep the Up Time display active
-
-  bool anUptimeRequestHadBeenMade = false;
-
-  while (true)
-  {
-
-    if (second() != previousSecond)
-    {
-
-      previousSecond = second();
-
-      if (checkUpTimeRequest())
-        displayUpTimeSecondsCounter = displayUpTimeSecondsToStayActive;
-
-      // Display the top line message (when it changes)
-      //
-      // Meanings of the top line message are:
-      //
-      //   the server is running                                             ESP32 Time Server
-      //
-      //   the server is running and a time refresh is underway              ESP32 Time Server *
-      //
-      //   the server is running and a time refresh is underway              ESP32 Time Server **
-      //   but the server denied the last time refresh as it
-      //   was outside the safeguard range
-      //
-      //   the user has pressed the button to request the server's up time   ESP32 Time Server's
-
-      int RequiredTopLineMessage;
-
-      if (displayUpTimeSecondsCounter > 0)
-        RequiredTopLineMessage = 4;
-      else if (SafeGuardTripped)
-        RequiredTopLineMessage = 3;
-      else if (theTimeSettingProcessIsUnderway)
-        RequiredTopLineMessage = 2;
-      else
-        RequiredTopLineMessage = 1;
-
-      if (RequiredTopLineMessage != previousTopLineMessage)
-      {
-
-        String TopLineMessage;
-        if (RequiredTopLineMessage == 1)
-          TopLineMessage = "ESP32 Time Server";
-        else if (RequiredTopLineMessage == 2)
-          TopLineMessage = "ESP32 Time Server *";
-        else if (RequiredTopLineMessage == 3)
-          TopLineMessage = "ESP32 Time Server **";
-        else if (RequiredTopLineMessage == 4)
-          TopLineMessage = "ESP32 Time Server's";
-
-        display(programNameRow, TopLineMessage, false);
-
-        previousTopLineMessage = RequiredTopLineMessage;
-      };
-
-      // If an NTP request is underway
-
-      // Display the IP address of the request
-      // also show system uptime
-
-      if (displayUpTimeSecondsCounter > 0)
-      {
-        display(upTimeRequestRow, "up time is", false);
-
-        // centre up time results on the display
-        String ws = GetUpTime();
-        int padLeftSpacesNeeded = (lcdColumns - ws.length()) / 2;
-        display(upTimeResultsRow, ws, false);
-
-        display(upTimeExplainRow, " days hrs:mins:secs", false);
-        anUptimeRequestHadBeenMade = true;
-
-        Serial.println(displayUpTimeSecondsCounter);
-        displayUpTimeSecondsCounter--;
-      }
-      else
-      {
-
-        // Display the date and time
-
-        static int lastSecond = -1;
-        static int lastDay = -1;
-
-        // Get the time
-        time_t now_UTC_Time = rtc.getEpoch();
-
-        // if an update request had previously been made, then both the date and time lines will need to be refreshed,
-        // otherwise:
-        //   if the second hasn't changed since the last time it was displayed, then the display doesn't need to be updated further
-
-        int thisSecond = second(now_UTC_Time);
-        if ((thisSecond != lastSecond) || anUptimeRequestHadBeenMade)
-        {
-
-          lastSecond = thisSecond;
-
-          // get the formated date and time as seperate strings
-
-          String dateLine = "";
-          String timeLine = "";
-          GetAdjustedDateAndTimeStrings(now_UTC_Time, dateLine, timeLine);
-
-          // update the time line on the display
-          display(timeRow, timeLine, false);
-
-          // if the date hasn't changed  since the last time it was displayed, then the display doesn't need to be updated
-
-          int thisDay = day(now_UTC_Time);
-          if ((thisDay != lastDay) || anUptimeRequestHadBeenMade)
-          {
-
-            // update the date line on the display
-            display(dateRow, dateLine, false);
-            lastDay = thisDay;
-          };
-
-          // if an uptime request had been made restore the ip address line
-          if (anUptimeRequestHadBeenMade)
-            display(ipAddressRow, ip);
-        };
-
-        vTaskDelay(975 / portTICK_PERIOD_MS);
-      };
-    };
-  };
-}
-
-void startAnOngoingTaskToUpdateTheDisplayEverySecond()
-{
-
-  // xTaskCreatePinnedToCore(
-  //     updateTheDisplay,     // Function that should be called
-  //     "Update the display", // Name of the task (for debugging)
-  //     3000,                 // Stack size (bytes)
-  //     NULL,                 // Parameter to pass
-  //     10,                   // Task priority
-  //     &taskHandle0,         // Task handle
-  //     0                     // use core 0 to split the load with setDateAndTimeFromGPS
-  // );
-}
-
-bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
-{
-  // Dump raw GPS output for 5 sec
-  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
-  unsigned long end = millis() + 5000;
-  while (millis() < end) {
-    if(GPSDevice.available()) {
-      Serial.write(GPSDevice.read());
-    }
-    delay(1);
-  }
-
-  bool baudRateNeedsToBeSet = true;
-  int attemptsToChangeTheBaudRate = 0;
-
-  while ((baudRateNeedsToBeSet) && (attemptsToChangeTheBaudRate < maxAattemptsToChangeTheBaudRate))
-  {
-
-    if (debugIsOn)
-    {
-      Serial.println("Attempt " + String(int(attemptsToChangeTheBaudRate + 1)) + " of " + String(maxAattemptsToChangeTheBaudRate) + ":");
-      Serial.println("  Set baud rate to " + String(gpsBaud));
-    }
-
-    GPSDevice.begin(gpsBaud, SERIAL_8N1, GPSPinRX, GPSPinTX);
-    delay(100);
-    // gps.enableDebugging();
-    if (gps.begin(GPSDevice))
-    {
-      // gps.setNMEAOutputPort(Serial);
-      baudRateNeedsToBeSet = false;
-    }
-    else
-    {
-
-      if (debugIsOn)
-        Serial.println("  Could not connect at a baud rate of " + String(gpsBaud) + ", now trying 9600 baud");
-
-      GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
-
-      if (gps.begin(GPSDevice))
-      {
-        if (debugIsOn)
-          Serial.println("  Connected at 9600 baud, switching to " + String(gpsBaud) + " baud");
-        gps.setSerialRate(gpsBaud);
-        delay(100);
-      }
-      else
-      {
-        if (debugIsOn)
-        {
-          Serial.println("  Could not connect at a baud rate of 9600 baud");
-          if ((attemptsToChangeTheBaudRate + 1) != maxAattemptsToChangeTheBaudRate)
-            Serial.println("  will try again");
-        };
-        // gps.factoryDefault();
-        delay(2000); // Wait a bit before trying again to limit the Serial output
-      };
-
-      attemptsToChangeTheBaudRate++;
-    };
-  };
-
-  //   gps.saveConfiguration();   // Optionally: if when you are testing this sketch the baud rate is constantly being
-  //                              // successfully set at the desired rate (38400) then you can uncomment this line of code
-  //                              // so that the GPS's configuration will default to starting at 34800 rather than 9600.
-  //                              // However, as this will only need to be done once this line of code should then be
-  //                              // commented back out for subsequent runs.  This procedure is entirely optional.
-
-  if (debugIsOn)
-  {
-    Serial.println("");
-    if (baudRateNeedsToBeSet)
-    {
-      Serial.println("The baud rate on the GPS could not be set to " + String(gpsBaud));
-    }
-    else
-    {
-      Serial.println("  Baud rate set to " + String(gpsBaud));
-    };
-    Serial.println("");
-  };
-
-  return !baudRateNeedsToBeSet;
-};
-
-void newNAVSAT(UBX_NAV_SAT_data_t *ubxDataStruct) {
-  Serial.println();
-
-  Serial.print(F("New NAV SAT data received. It contains data for "));
-  Serial.print(ubxDataStruct->header.numSvs);
-  if (ubxDataStruct->header.numSvs == 1)
-    Serial.println(F(" SV."));
-  else
-    Serial.println(F(" SVs."));
-
-  // Just for giggles, print the signal strength for each SV as a barchart
-  for (uint16_t block = 0; block < ubxDataStruct->header.numSvs; block++) // For each SV
-  {
-    switch (ubxDataStruct->blocks[block].gnssId) // Print the GNSS ID
-    {
-      case 0:
-        Serial.print(F("GPS     "));
-      break;
-      case 1:
-        Serial.print(F("SBAS    "));
-      break;
-      case 2:
-        Serial.print(F("Galileo "));
-      break;
-      case 3:
-        Serial.print(F("BeiDou  "));
-      break;
-      case 4:
-        Serial.print(F("IMES    "));
-      break;
-      case 5:
-        Serial.print(F("QZSS    "));
-      break;
-      case 6:
-        Serial.print(F("GLONASS "));
-      break;
-      default:
-        Serial.print(F("UNKNOWN "));
-      break;      
-    }
-    
-    Serial.print(ubxDataStruct->blocks[block].svId); // Print the SV ID
-    
-    if (ubxDataStruct->blocks[block].svId < 10) Serial.print(F("   "));
-    else if (ubxDataStruct->blocks[block].svId < 100) Serial.print(F("  "));
-    else Serial.print(F(" "));
-
-    // Print the signal strength as a bar chart
-    for (uint8_t cno = 0; cno < ubxDataStruct->blocks[block].cno; cno++)
-      Serial.print(F("="));
-
-    Serial.println();
-  }
-}
-
-void setupGPS()
-{
-
-  if (!setTheGPSBaudRate(GPSBaud, 10))
-  {
-    display(1, "Something is wrong");
-    display(2, "couldn't communicate");
-    display(3, "with the GPS device.");
-    // Freeze here
-    while (true)
-      ;
-  };
-
-  gps.setI2COutput(0);
-  // gps.setUART1Output(COM_TYPE_UBX | COM_TYPE_NMEA);
-  gps.setUART1Output(COM_TYPE_UBX);
-  gps.setUART2Output(0);
-
-  Serial.println("Enabling GPS, SBAS, and Galileo...");
-  gps.enableGNSS(true, SFE_UBLOX_GNSS_ID_GPS);
-  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_SBAS);
-  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_BEIDOU);
-  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_IMES);
-  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_QZSS);
-  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_GLONASS);
-  gps.enableGNSS(true, SFE_UBLOX_GNSS_ID_GALILEO);
-  delay(2000);
-
-  gps.setNavigationFrequency(1); //Produce one solution per second
-  gps.setAutoNAVSATcallbackPtr(&newNAVSAT);
-  
-  display(1, "Waiting for GPS fix");
-
-  unsigned long nextCheck = millis() + oneSecond_inMilliseconds;
-  byte fixType;
-
-  bool continueWaitingForAFix = true;
-  while (continueWaitingForAFix)
-  {
-    // only check once a second
-    if (millis() > nextCheck)
-    {
-
-      nextCheck = millis() + oneSecond_inMilliseconds;
-
-      fixType = gps.getFixType();
-      if ((fixType > 0) && (fixType < 6))
-      {
-
-        String msg;
-        switch (int(fixType))
-        {
-        case 0:
-          msg = "No fix";
-          break;
-        case 1:
-          msg = "Dead reckoning";
-          break;
-        case 2:
-          msg = "2D";
-          break;
-        case 3:
-          msg = "3D";
-          break;
-        case 4:
-          msg = "GNSS + Dead reckoning";
-          break;
-        case 5:
-          msg = "Date and time";
-          break;
-        };
-        display(1, "GPS fix obtained");
-        display(2, msg);
-        delay(5000);
-
-        continueWaitingForAFix = false;
-      } else {
-        gps.getNAVSAT();
-        gps.getSIV();
-      }
-    }
-
-    gps.checkUblox();
-    gps.checkCallbacks();
-    delay(50);
-  }
-  gps.setAutoNAVSATcallbackPtr(NULL);
-}
-
-void setDateAndTimeFromGPS(void *parameter)
-{
-
-  static bool thisIsTheFirstTimeSetBeingMadeAtStartup = true;
+void setDateAndTimeFromGPS(void *parameter) {
   static unsigned long lastAdjustmentMicros = 0;
   static double lastPpmDrift = 0;
 
@@ -632,169 +170,122 @@ void setDateAndTimeFromGPS(void *parameter)
   if (debugIsOn)
     Serial.println("Start setDateAndTimeFromGPS task");
 
-  while (true)
-  {
-
-    theTimeSettingProcessIsUnderway = true;
-
+  while (true) {
     // wait for the ppsFlag to be raised at the start of the 1st second
     ppsFlag = false;
     while (!ppsFlag) {
       delay(10);
     }
 
-    if (gps.getPVT()) // get latest time data (to reflect the start of the next second)
-    {
-      if (gps.getDateValid() && gps.getTimeValid()) // make sure the date and time are valid (in that values are populated)
+    if (gps.date.isValid() && gps.time.isValid()) {
+      struct tm wt;
+      wt.tm_year = gps.date.year();
+      wt.tm_mon = gps.date.month();
+      wt.tm_mday = gps.date.day();
+      wt.tm_hour = gps.time.hour();
+      wt.tm_min = gps.time.minute();
+      wt.tm_sec = gps.time.second();
+
+      wt.tm_year -= 1900;  // adjust year (see you again in 2036)
+      wt.tm_mon -= 1;      // adjust month (January is month 0)
+
+      // by the time the next pps pulse comes around it will be one second later
+      candidateDateAndTime = mktime(&wt) + 1;
+
+      if (debugIsOn) {
+        Serial.println("Received date and time " + String(wt.tm_year) + " " + String(wt.tm_mon) + " " + String(wt.tm_mday) + " " + String(wt.tm_hour) + " " + String(wt.tm_min) + " " + String(wt.tm_sec));
+      }
+
+      // give some time to ensure the PPS pin is reset
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+
+      // wait for the PPS flag to be raised (signifying the true start of the candidate time)
+      ppsFlag = false;
+      while (!ppsFlag)
+        ;
+
+      unsigned long pegProcessingAdjustmentStartTime = micros();
+      struct timeval tv_now;
+      gettimeofday(&tv_now, NULL);
+      suseconds_t rtcMicrosAfterPPSFlag = tv_now.tv_usec;
+
+      // at this point:
+      // apply a sanity check; the current rtc time and the candidate time just taken from the gps readings which will be used to refresh the current rtc should be within a second of each other (safeguardThresholdInSeconds)
+      // if the sanity check fails, do not set the time and raise a Safeguard flag which be used to update the display to show the user the latest time refresh failed
+      // if the sanity check passes, proceed with refreshing the time and if the Safeguard flag been previously been raised then lower it
+
+      bool SanityCheckPassed;
+      time_t updateDelta;
+
+      if (!didSetGPSTime) {
+        SanityCheckPassed = true;
+      } else {
+        time_t currentRTC = tv_now.tv_sec;
+        updateDelta = candidateDateAndTime - currentRTC;
+        SanityCheckPassed = (((updateDelta >= safeguardThresholdLow) && (updateDelta <= safeguardThresholdHigh)));
+      }
+
+      if (SanityCheckPassed)
       {
 
-        struct tm wt;
-        wt.tm_year = gps.getYear();
-        wt.tm_mon = gps.getMonth();
-        wt.tm_mday = gps.getDay();
-        wt.tm_hour = gps.getHour();
-        wt.tm_min = gps.getMinute();
-        wt.tm_sec = gps.getSecond();
-
-        if ((wt.tm_year > 2022) && (wt.tm_mon > 0) && (wt.tm_mon < 13) && (wt.tm_mday > 0) && (wt.tm_mday < 32) && (wt.tm_hour < 24) && (wt.tm_min < 60) && (wt.tm_sec < 61)) // make sure the values are within reason
+        // place a hold on (the date and time) so if an NTP request is underway in the fraction of a second this code will take, the time and date values don't change mid way through that request.
+        if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE)
         {
 
-          // set candidate time according the gps (this will be effective when the PPS flag is next raised)
-          wt.tm_year -= 1900;                     // adjust year (see you again in 2036)
-          wt.tm_mon -= 1;                         // adjust month (January is month 0)
-          candidateDateAndTime = mktime(&wt) + 1; // not sure why the + 1 but it is
+          // set the date and time
+          unsigned long pegProcessingAdjustmentEndTime = micros();
+          unsigned long ProcessingAdjustment = pegProcessingAdjustmentEndTime - pegProcessingAdjustmentStartTime;
 
+          // set the real time clock
+          rtc.setTime((unsigned long)candidateDateAndTime, (int)ProcessingAdjustment);
+
+          // release the hold
+          xSemaphoreGive(mutex);
+
+          if (debugIsOn) {
+            Serial.print("Date and time set to ");
+            String ws = rtc.getDateTime(true);
+            ws.trim();
+            Serial.println(ws + " (UTC)");
+          }
+
+          if (didSetGPSTime) {
+            // calculate drift
+            unsigned long microsBetweenAdjustments = pegProcessingAdjustmentStartTime - lastAdjustmentMicros;
+            time_t deltaMicros = (updateDelta * 1000000) - rtcMicrosAfterPPSFlag;
+            double ppmDrift = ((double)deltaMicros / (double)microsBetweenAdjustments) * 1000000.0;
+
+            if (debugIsOn) {
+              Serial.println("rtcMicrosAfterPPSFlag = " + String(rtcMicrosAfterPPSFlag));
+              Serial.println("We adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
+              Serial.print(microsBetweenAdjustments);
+              Serial.print("us passed between adjustments. Clock drift is ");
+              Serial.print(ppmDrift);
+              Serial.print("ppm. Last run was ");
+              Serial.println(lastPpmDrift);
+            }
+
+            lastPpmDrift = ppmDrift;
+          }
+
+          lastAdjustmentMicros = pegProcessingAdjustmentStartTime;
+          SafeGuardTripped = false;
+          didSetGPSTime = true;
+
+          // whew that was hard work but fun, lets take a break and then do it all again
+          vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
+        }
+        else
+        {
           if (debugIsOn)
-            Serial.println("Candidate date and time " + String(wt.tm_year) + " " + String(wt.tm_mon) + " " + String(wt.tm_mday) + " " + String(wt.tm_hour) + " " + String(wt.tm_min) + " " + String(wt.tm_sec));
-
-          time_t wt = candidateDateAndTime;
-          time_t candidateDateAndTime_t = time(&wt);
-
-          // give some time to ensure the PPS pin is reset
-          vTaskDelay(200 / portTICK_PERIOD_MS);
-
-          // wait for the PPS flag to be raised (signifying the true start of the candidate time)
-          ppsFlag = false;
-          while (!ppsFlag)
-            ;
-
-          unsigned long pegProcessingAdjustmentStartTime = micros();
-          struct timeval tv_now;
-          gettimeofday(&tv_now, NULL);
-          suseconds_t rtcMicrosAfterPPSFlag = tv_now.tv_usec;
-          
-          // at this point:
-          // apply a sanity check; the current rtc time and the candidate time just taken from the gps readings which will be used to refresh the current rtc should be within a second of each other (safeguardThresholdInSeconds)
-          // if the sanity check fails, do not set the time and raise a Safeguard flag which be used to update the display to show the user the latest time refresh failed
-          // if the sanity check passes, proceed with refreshing the time and if the Safeguard flag been previously been raised then lower it
-
-          bool SanityCheckPassed;
-          time_t updateDelta;
-
-          if (thisIsTheFirstTimeSetBeingMadeAtStartup)
           {
-            SanityCheckPassed = true;
-          }
-          else
-          {
-            time_t currentRTC_t = tv_now.tv_sec;
-            updateDelta = candidateDateAndTime_t - currentRTC_t;
-            bool SanityCheckPassed = (((updateDelta >= safeguardThresholdLow) && (updateDelta <= safeguardThresholdHigh)));
-          }
-
-          if (SanityCheckPassed)
-          {
-
-            // place a hold on (the date and time) so if an NTP request is underway in the fraction of a second this code will take, the time and date values don't change mid way through that request.
-            if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE)
-            {
-
-              // set the date and time
-              unsigned long pegProcessingAdjustmentEndTime = micros();
-              unsigned long ProcessingAdjustment = pegProcessingAdjustmentEndTime - pegProcessingAdjustmentStartTime;
-
-              // set the real time clock
-              rtc.setTime((unsigned long)candidateDateAndTime, (int)ProcessingAdjustment);
-
-              // release the hold
-              xSemaphoreGive(mutex);
-
-              if (debugIsOn) {
-                Serial.print("Date and time set to ");
-                String ws = rtc.getDateTime(true);
-                ws.trim();
-                Serial.println(ws + " (UTC)");
-              }
-
-              if (!thisIsTheFirstTimeSetBeingMadeAtStartup) {
-                // calculate drift
-                unsigned long microsBetweenAdjustments = pegProcessingAdjustmentStartTime - lastAdjustmentMicros;
-                time_t deltaMicros = (updateDelta * 1000000) - rtcMicrosAfterPPSFlag;
-                double ppmDrift = ((double)deltaMicros / (double)microsBetweenAdjustments) * 1000000.0;
-
-                if (debugIsOn) {
-                  Serial.println("rtcMicrosAfterPPSFlag = " + String(rtcMicrosAfterPPSFlag));
-                  Serial.println("We adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
-                  Serial.print(microsBetweenAdjustments);
-                  Serial.print("us passed between adjustments. This means our clock drift is ");
-                  Serial.print(ppmDrift);
-                  Serial.print("ppm. From our last run we would have expected ");
-                  Serial.println(lastPpmDrift);
-                }
-
-                lastPpmDrift = ppmDrift;
-              }
-
-              lastAdjustmentMicros = pegProcessingAdjustmentStartTime;
-              SafeGuardTripped = false;
-              theTimeSettingProcessIsUnderway = false;
-              thisIsTheFirstTimeSetBeingMadeAtStartup = false;
-
-              // whew that was hard work but fun, lets take a break and then do it all again
-              vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
-            }
-            else
-            {
-              if (debugIsOn)
-              {
-                Serial.println("Could not refresh the time as a NTP request was underway");
-                Serial.println("Will try again");
-              }
-            }
-          }
-          else
-          {
-            if (debugIsOn)
-            {
-              Serial.println("This date and time refresh failed its sanity check with a time delta of " + String(updateDelta) + " seconds");
-              Serial.println("The time was not refreshed.");
-              Serial.print("Date and time are ");
-              String ws = rtc.getDateTime(true);
-              ws.trim();
-              Serial.println(ws + " (UTC)");
-              Serial.println("Will try again");
-            }
-
-            SafeGuardTripped = true;
+            Serial.println("Could not refresh the time as a NTP request was underway");
+            Serial.println("Will try again");
           }
         }
       }
     }
   }
-}
-
-void startAnOngoingTaskToRefreshTheDateAndTimeFromTheGPS()
-{
-
-  xTaskCreatePinnedToCore(
-      setDateAndTimeFromGPS,
-      "Set Date and Time from GPS",
-      3000,
-      NULL,
-      20, // task priority must be reasonably high or the queues from which the gps data is drawn will not be adequately replenished
-      &taskHandle1,
-      1 // use core 1 to split the load with updateTheDisplay
-  );
 }
 
 void EthEvent(WiFiEvent_t event)
@@ -1044,55 +535,59 @@ void ppsHandlerRising()
   ppsFlag = true; // raise the flag that signals the start of the next second
 }
 
-void setup()
-{
+void setup() {
+  Serial.begin(SerialMonitorSpeed);
+  Serial.println("ESP32 Time Server starting");
 
-  setupSerial();
+  // wifi and bluetooth aren't needed so turn them off
+  Serial.println("Disabling wifi and bluetooth");
+  WiFi.mode(WIFI_OFF);
+  btStop();
 
-  if (debugIsOn)
-    Serial.println("ESP32 Time Server starting setup ...");
-
-  turnOffWifiAndBluetooth();
-
-  setupButton();
-
-  setupDisplay();
-
-  display(1, "GPS setup underway");
-  setupGPS();
-
-  display(1, "Getting date & time", false);
-  display(2, " ", false);
-  display(3, " ", false);
-
-  // create a mutex to be used to ensure an NTP request results are not impacted by the process that refreshes the time
-   mutex = xSemaphoreCreateMutex();
-
-  // setup for the use of the pulse-per-second pin
+  // interrupt handler for the pulse-per-second pin
   pinMode(GPSPinPPS, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(GPSPinPPS), ppsHandlerRising, RISING);
 
-  startAnOngoingTaskToRefreshTheDateAndTimeFromTheGPS();
+  // create a mutex to be used to ensure an NTP request results are not impacted by the process that refreshes the time
+  mutex = xSemaphoreCreateMutex();
+
+  Serial.println("Opening GPS with 9600 baud");
+  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
+
+  // TODO: Switch to 115k2 baud?
+
+  // set up periodic date/time task
+  xTaskCreatePinnedToCore(
+    setDateAndTimeFromGPS,
+    "Set Date and Time from GPS",
+    3000,
+    NULL,
+    20, // task priority must be reasonably high or the queues from which the gps data is drawn will not be adequately replenished
+    &taskHandle1,
+    0 // core 1 handles setup() and loop()
+  );
 
   // wait until the time is actually set
-  while (theTimeSettingProcessIsUnderway)
+  Serial.println("Waiting for GPS time...");
+  while (!didSetGPSTime) {
+    while (GPSDevice.available()) {
+      gps.encode(GPSDevice.read());
+    }
     delay(10);
+  }
 
-  display(1, "Connecting Ethernet", false);
-  display(2, " ", false);
-  display(3, " ", false);
+  Serial.println("Setting up networking");
   setupEthernet();
   startUDPSever();
 
-  startAnOngoingTaskToUpdateTheDisplayEverySecond();
-
-  if (debugIsOn)
-    Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
+  Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
 }
 
 void loop()
 {
-  gps.checkUblox();
-  gps.checkCallbacks();
+  while (GPSDevice.available()) {
+    if(gps.encode(GPSDevice.read())) {
+    }
+  }
   processNTPRequests();
 }
