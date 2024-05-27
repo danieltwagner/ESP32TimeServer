@@ -47,11 +47,10 @@ WiFiUDP Udp;
 // Constants and global variables
 const unsigned long oneSecond_inMilliseconds = 1000;                              // one second in milliseconds
 const unsigned long oneMinute_inMilliseconds = 60 * oneSecond_inMilliseconds;     // one minute in milliseconds
-const unsigned long thirtyMinutes_inMilliseconds = 30 * oneMinute_inMilliseconds; // 30 minutes in milliseconds
 const long oneSecond_inMicroseconds_L = 1000000;                                  // one second in microseconds (signed long)
 const double oneSecond_inMicroseconds_D = 1000000.0;                              // one second in microseconds (double)
                                                                                   //
-const unsigned long periodicTimeRefreshPeriod = thirtyMinutes_inMilliseconds;     // how often the system's real time clock is refreshed with GPS data
+const unsigned long periodicTimeRefreshPeriod = oneMinute_inMilliseconds;         // how often the system's real time clock is refreshed with GPS data
 const time_t safeguardThresholdInSeconds = 1;                                     // used to ensure a GPS time refresh is only performed if the difference between the old and new times is this many seconds or less
 volatile bool SafeGuardTripped = false;                                           // used to ensure the time isn't changed beyond that which would reasonably be expected within the periodicTimeRefreshPeriod
                                                                                   //
@@ -376,19 +375,28 @@ void updateTheDisplay(void *parameter)
 void startAnOngoingTaskToUpdateTheDisplayEverySecond()
 {
 
-  xTaskCreatePinnedToCore(
-      updateTheDisplay,     // Function that should be called
-      "Update the display", // Name of the task (for debugging)
-      3000,                 // Stack size (bytes)
-      NULL,                 // Parameter to pass
-      10,                   // Task priority
-      &taskHandle0,         // Task handle
-      0                     // use core 0 to split the load with setDateAndTimeFromGPS
-  );
+  // xTaskCreatePinnedToCore(
+  //     updateTheDisplay,     // Function that should be called
+  //     "Update the display", // Name of the task (for debugging)
+  //     3000,                 // Stack size (bytes)
+  //     NULL,                 // Parameter to pass
+  //     10,                   // Task priority
+  //     &taskHandle0,         // Task handle
+  //     0                     // use core 0 to split the load with setDateAndTimeFromGPS
+  // );
 }
 
 bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
 {
+  // Dump raw GPS output for 5 sec
+  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
+  unsigned long end = millis() + 5000;
+  while (millis() < end) {
+    if(GPSDevice.available()) {
+      Serial.write(GPSDevice.read());
+    }
+    delay(1);
+  }
 
   bool baudRateNeedsToBeSet = true;
   int attemptsToChangeTheBaudRate = 0;
@@ -407,7 +415,7 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
     // gps.enableDebugging();
     if (gps.begin(GPSDevice))
     {
-      gps.setNMEAOutputPort(Serial);
+      // gps.setNMEAOutputPort(Serial);
       baudRateNeedsToBeSet = false;
     }
     else
@@ -464,6 +472,61 @@ bool setTheGPSBaudRate(int gpsBaud, int maxAattemptsToChangeTheBaudRate)
   return !baudRateNeedsToBeSet;
 };
 
+void newNAVSAT(UBX_NAV_SAT_data_t *ubxDataStruct) {
+  Serial.println();
+
+  Serial.print(F("New NAV SAT data received. It contains data for "));
+  Serial.print(ubxDataStruct->header.numSvs);
+  if (ubxDataStruct->header.numSvs == 1)
+    Serial.println(F(" SV."));
+  else
+    Serial.println(F(" SVs."));
+
+  // Just for giggles, print the signal strength for each SV as a barchart
+  for (uint16_t block = 0; block < ubxDataStruct->header.numSvs; block++) // For each SV
+  {
+    switch (ubxDataStruct->blocks[block].gnssId) // Print the GNSS ID
+    {
+      case 0:
+        Serial.print(F("GPS     "));
+      break;
+      case 1:
+        Serial.print(F("SBAS    "));
+      break;
+      case 2:
+        Serial.print(F("Galileo "));
+      break;
+      case 3:
+        Serial.print(F("BeiDou  "));
+      break;
+      case 4:
+        Serial.print(F("IMES    "));
+      break;
+      case 5:
+        Serial.print(F("QZSS    "));
+      break;
+      case 6:
+        Serial.print(F("GLONASS "));
+      break;
+      default:
+        Serial.print(F("UNKNOWN "));
+      break;      
+    }
+    
+    Serial.print(ubxDataStruct->blocks[block].svId); // Print the SV ID
+    
+    if (ubxDataStruct->blocks[block].svId < 10) Serial.print(F("   "));
+    else if (ubxDataStruct->blocks[block].svId < 100) Serial.print(F("  "));
+    else Serial.print(F(" "));
+
+    // Print the signal strength as a bar chart
+    for (uint8_t cno = 0; cno < ubxDataStruct->blocks[block].cno; cno++)
+      Serial.print(F("="));
+
+    Serial.println();
+  }
+}
+
 void setupGPS()
 {
 
@@ -478,10 +541,23 @@ void setupGPS()
   };
 
   gps.setI2COutput(0);
-  gps.setUART1Output(COM_TYPE_UBX); // Set the UART port to output UBX only
   // gps.setUART1Output(COM_TYPE_UBX | COM_TYPE_NMEA);
+  gps.setUART1Output(COM_TYPE_UBX);
   gps.setUART2Output(0);
 
+  Serial.println("Enabling GPS, SBAS, and Galileo...");
+  gps.enableGNSS(true, SFE_UBLOX_GNSS_ID_GPS);
+  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_SBAS);
+  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_BEIDOU);
+  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_IMES);
+  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_QZSS);
+  // gps.enableGNSS(false, SFE_UBLOX_GNSS_ID_GLONASS);
+  gps.enableGNSS(true, SFE_UBLOX_GNSS_ID_GALILEO);
+  delay(2000);
+
+  gps.setNavigationFrequency(1); //Produce one solution per second
+  gps.setAutoNAVSATcallbackPtr(&newNAVSAT);
+  
   display(1, "Waiting for GPS fix");
 
   unsigned long nextCheck = millis() + oneSecond_inMilliseconds;
@@ -497,7 +573,6 @@ void setupGPS()
       nextCheck = millis() + oneSecond_inMilliseconds;
 
       fixType = gps.getFixType();
-      Serial.println("Fix type is " + String(fixType));
       if ((fixType > 0) && (fixType < 6))
       {
 
@@ -528,18 +603,25 @@ void setupGPS()
         delay(5000);
 
         continueWaitingForAFix = false;
-      };
-    };
+      } else {
+        gps.getNAVSAT();
+        gps.getSIV();
+      }
+    }
 
     gps.checkUblox();
-    delay(250);
-  };
+    gps.checkCallbacks();
+    delay(50);
+  }
+  gps.setAutoNAVSATcallbackPtr(NULL);
 }
 
 void setDateAndTimeFromGPS(void *parameter)
 {
 
   static bool thisIsTheFirstTimeSetBeingMadeAtStartup = true;
+  static unsigned long lastAdjustmentMicros = 0;
+  static double lastPpmDrift = 0;
 
   /// used below to ensure a GPS time refresh if is only performed if the difference between the old and new times is reasonable for the periodicTimeRefreshPeriod
   const time_t safeguardThresholdHigh = safeguardThresholdInSeconds;
@@ -557,12 +639,12 @@ void setDateAndTimeFromGPS(void *parameter)
 
     // wait for the ppsFlag to be raised at the start of the 1st second
     ppsFlag = false;
-    while (!ppsFlag)
-      ;
+    while (!ppsFlag) {
+      delay(10);
+    }
 
     if (gps.getPVT()) // get latest time data (to reflect the start of the next second)
     {
-
       if (gps.getDateValid() && gps.getTimeValid()) // make sure the date and time are valid (in that values are populated)
       {
 
@@ -586,7 +668,7 @@ void setDateAndTimeFromGPS(void *parameter)
             Serial.println("Candidate date and time " + String(wt.tm_year) + " " + String(wt.tm_mon) + " " + String(wt.tm_mday) + " " + String(wt.tm_hour) + " " + String(wt.tm_min) + " " + String(wt.tm_sec));
 
           time_t wt = candidateDateAndTime;
-          time_t candiateDateAndTime_t = time(&wt);
+          time_t candidateDateAndTime_t = time(&wt);
 
           // give some time to ensure the PPS pin is reset
           vTaskDelay(200 / portTICK_PERIOD_MS);
@@ -597,7 +679,10 @@ void setDateAndTimeFromGPS(void *parameter)
             ;
 
           unsigned long pegProcessingAdjustmentStartTime = micros();
-
+          struct timeval tv_now;
+          gettimeofday(&tv_now, NULL);
+          suseconds_t rtcMicrosAfterPPSFlag = tv_now.tv_usec;
+          
           // at this point:
           // apply a sanity check; the current rtc time and the candidate time just taken from the gps readings which will be used to refresh the current rtc should be within a second of each other (safeguardThresholdInSeconds)
           // if the sanity check fails, do not set the time and raise a Safeguard flag which be used to update the display to show the user the latest time refresh failed
@@ -612,11 +697,10 @@ void setDateAndTimeFromGPS(void *parameter)
           }
           else
           {
-            time_t currentRTC_t = rtc.getEpoch();
-            time_t currentRTCDateAndTime_t = time(&currentRTC_t);
-            updateDelta = currentRTCDateAndTime_t - candiateDateAndTime_t;
+            time_t currentRTC_t = tv_now.tv_sec;
+            updateDelta = candidateDateAndTime_t - currentRTC_t;
             bool SanityCheckPassed = (((updateDelta >= safeguardThresholdLow) && (updateDelta <= safeguardThresholdHigh)));
-          };
+          }
 
           if (SanityCheckPassed)
           {
@@ -626,7 +710,6 @@ void setDateAndTimeFromGPS(void *parameter)
             {
 
               // set the date and time
-
               unsigned long pegProcessingAdjustmentEndTime = micros();
               unsigned long ProcessingAdjustment = pegProcessingAdjustmentEndTime - pegProcessingAdjustmentStartTime;
 
@@ -636,14 +719,33 @@ void setDateAndTimeFromGPS(void *parameter)
               // release the hold
               xSemaphoreGive(mutex);
 
-              if (debugIsOn)
-              {
+              if (debugIsOn) {
                 Serial.print("Date and time set to ");
                 String ws = rtc.getDateTime(true);
                 ws.trim();
                 Serial.println(ws + " (UTC)");
-              };
+              }
 
+              if (!thisIsTheFirstTimeSetBeingMadeAtStartup) {
+                // calculate drift
+                unsigned long microsBetweenAdjustments = pegProcessingAdjustmentStartTime - lastAdjustmentMicros;
+                time_t deltaMicros = (updateDelta * 1000000) - rtcMicrosAfterPPSFlag;
+                double ppmDrift = ((double)deltaMicros / (double)microsBetweenAdjustments) * 1000000.0;
+
+                if (debugIsOn) {
+                  Serial.println("rtcMicrosAfterPPSFlag = " + String(rtcMicrosAfterPPSFlag));
+                  Serial.println("We adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
+                  Serial.print(microsBetweenAdjustments);
+                  Serial.print("us passed between adjustments. This means our clock drift is ");
+                  Serial.print(ppmDrift);
+                  Serial.print("ppm. From our last run we would have expected ");
+                  Serial.println(lastPpmDrift);
+                }
+
+                lastPpmDrift = ppmDrift;
+              }
+
+              lastAdjustmentMicros = pegProcessingAdjustmentStartTime;
               SafeGuardTripped = false;
               theTimeSettingProcessIsUnderway = false;
               thisIsTheFirstTimeSetBeingMadeAtStartup = false;
@@ -657,7 +759,7 @@ void setDateAndTimeFromGPS(void *parameter)
               {
                 Serial.println("Could not refresh the time as a NTP request was underway");
                 Serial.println("Will try again");
-              };
+              }
             }
           }
           else
@@ -671,15 +773,15 @@ void setDateAndTimeFromGPS(void *parameter)
               ws.trim();
               Serial.println(ws + " (UTC)");
               Serial.println("Will try again");
-            };
+            }
 
             SafeGuardTripped = true;
-          };
-        };
-      };
-    };
-  };
-};
+          }
+        }
+      }
+    }
+  }
+}
 
 void startAnOngoingTaskToRefreshTheDateAndTimeFromTheGPS()
 {
@@ -693,7 +795,7 @@ void startAnOngoingTaskToRefreshTheDateAndTimeFromTheGPS()
       &taskHandle1,
       1 // use core 1 to split the load with updateTheDisplay
   );
-};
+}
 
 void EthEvent(WiFiEvent_t event)
 {
@@ -730,7 +832,7 @@ void EthEvent(WiFiEvent_t event)
   }
 }
 
-void setupEitherNet()
+void setupEthernet()
 {
 
   WiFi.onEvent(EthEvent);
@@ -979,7 +1081,7 @@ void setup()
   display(1, "Connecting Ethernet", false);
   display(2, " ", false);
   display(3, " ", false);
-  setupEitherNet();
+  setupEthernet();
   startUDPSever();
 
   startAnOngoingTaskToUpdateTheDisplayEverySecond();
@@ -991,5 +1093,6 @@ void setup()
 void loop()
 {
   gps.checkUblox();
+  gps.checkCallbacks();
   processNTPRequests();
 }
