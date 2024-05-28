@@ -49,9 +49,9 @@ const double oneSecond_inMicroseconds_D = 1000000.0;                            
                                                                                   //
 const unsigned long periodicTimeRefreshPeriod = oneMinute_inMilliseconds;         // how often the system's real time clock is refreshed with GPS data
 const time_t safeguardThresholdInSeconds = 1;                                     // used to ensure a GPS time refresh is only performed if the difference between the old and new times is this many seconds or less
-volatile bool SafeGuardTripped = false;                                           // used to ensure the time isn't changed beyond that which would reasonably be expected within the periodicTimeRefreshPeriod
-                                                                                  //
+
 volatile bool didSetGPSTime;  // have we ever set time based on GPS?
+volatile int8_t precision;
 
 //
 SemaphoreHandle_t mutex;         // used to ensure an NTP request results are not impacted by the process that refreshes the time
@@ -201,8 +201,9 @@ void setDateAndTimeFromGPS(void *parameter) {
 
       // wait for the PPS flag to be raised (signifying the true start of the candidate time)
       ppsFlag = false;
-      while (!ppsFlag)
-        ;
+      while (!ppsFlag) {
+        vTaskDelay(portTICK_PERIOD_MS/10);
+      }
 
       unsigned long pegProcessingAdjustmentStartTime = micros();
       struct timeval tv_now;
@@ -269,7 +270,6 @@ void setDateAndTimeFromGPS(void *parameter) {
           }
 
           lastAdjustmentMicros = pegProcessingAdjustmentStartTime;
-          SafeGuardTripped = false;
           didSetGPSTime = true;
 
           // whew that was hard work but fun, lets take a break and then do it all again
@@ -341,44 +341,14 @@ void startUDPSever()
 
 uint64_t getCurrentTimeInNTP64BitFormat()
 {
+  const uint64_t secsBetween1900and1970 = 2208988800;
 
-  const uint64_t numberOfSecondsBetween1900and1970 = 2208988800;
-
-  uint64_t clockSecondsSinceEpoch = numberOfSecondsBetween1900and1970 + (uint64_t)rtc.getEpoch();
-  long clockMicroSeconds = (long)rtc.getMicros();
-
-  // as one might infer clockMicroSeconds is in microseconds (i.e. 1 second = 1,000,000 microseconds)
-  //
-  // accordingly, if the clockMicroSeconds is greater than one million ...
-  //   for every million that is over:
-  //     add 1 (second) to clockSecondsSinceEpoch, and
-  //     reduce the clockMicroSeconds by one million (microseconds)
-  //
-  // likewise ...
-  //
-  // if the clockMicroSeconds is less than zero:
-  //   for every million that is under zero:
-  //     subtract (second) from clockSecondsSinceEpoch, and
-  //     increase the clockMicroSeconds by one million (microseconds)
-
-  while (clockMicroSeconds > oneSecond_inMicroseconds_L)
-  {
-    clockSecondsSinceEpoch++;
-    clockMicroSeconds -= oneSecond_inMicroseconds_L;
-  };
-
-  while (clockMicroSeconds < 0L)
-  {
-    clockSecondsSinceEpoch--;
-    clockMicroSeconds += oneSecond_inMicroseconds_L;
-  };
-
-  // for the next two lines to be clear, please see: https://tickelton.gitlab.io/articles/ntp-timestamps/
-
-  double clockMicroSeconds_D = (double)clockMicroSeconds * (double)(4294.967296);
-  uint64_t ntpts = ((uint64_t)clockSecondsSinceEpoch << 32) | (uint64_t)(clockMicroSeconds_D);
-
-  return ntpts;
+  struct timeval tv_now;
+  gettimeofday(&tv_now, NULL);
+  
+  uint64_t seconds = (uint64_t)tv_now.tv_sec + secsBetween1900and1970;
+  uint64_t fraction = (uint64_t)((double)(tv_now.tv_usec + 1) * (double)(1LL << 32) * 1.0e-6);
+  return (seconds << 32) | fraction;
 }
 
 // send NTP reply
@@ -409,28 +379,17 @@ void sendNTPpacket(IPAddress remoteIP, int remotePort)
   // 0xF9 <--> -7 <--> 0.0078125 s
   // 0xFA <--> -6 <--> 0.0156250 s
   // 0xFB <--> -5 <--> 0.0312500 s
-  packetBuffer[3] = 0xF7;
+  packetBuffer[3] = precision;
 
   // 8 bytes for Root Delay & Root Dispersion
-  // root delay
-  packetBuffer[4] = 0;
-  packetBuffer[5] = 0;
-  packetBuffer[6] = 0;
-  packetBuffer[7] = 0;
-
-  // root dispersion
-  packetBuffer[8] = 0;
-  packetBuffer[9] = 0;
-  packetBuffer[10] = 0;
   packetBuffer[11] = 0x50;
 
   // time source (namestring)
   packetBuffer[12] = 71; // G
   packetBuffer[13] = 80; // P
   packetBuffer[14] = 83; // S
-  packetBuffer[15] = 0;
 
-  // get the current time and write it out as the reference time to bytes 16 to 23 of the response packet
+   // get the current time and write it out as the reference time to bytes 16 to 23 of the response packet
   uint64_t referenceTime_uint64_t = getCurrentTimeInNTP64BitFormat();
 
   packetBuffer[16] = (int)((referenceTime_uint64_t >> 56) & 0xFF);
@@ -473,6 +432,23 @@ void sendNTPpacket(IPAddress remoteIP, int remotePort)
   packetBuffer[45] = (int)((transmitTime_uint64_t >> 16) & 0xFF);
   packetBuffer[46] = (int)((transmitTime_uint64_t >> 8) & 0xFF);
   packetBuffer[47] = (int)(transmitTime_uint64_t & 0xFF);
+
+  /*
+  uint64_t *pb64 = (uint64_t *)packetBuffer;
+  // get the current time and write it out as the reference time to bytes 16 to 23 of the response packet
+  uint64_t referenceTime_uint64_t = getCurrentTimeInNTP64BitFormat();
+  pb64[2] = referenceTime_uint64_t;
+
+  // Copy transmit time from the NTP original request (bytes 40 to 47) to response (bytes 24 to 31)
+  pb64[3] = pb64[5];
+
+  // Write the receive time (bytes 32 to 39)
+  pb64[4] = receiveTime_uint64_t;
+
+  // Write the transmit time (bytes 40 to 47)
+  uint64_t transmitTime_uint64_t = getCurrentTimeInNTP64BitFormat();
+  pb64[5] = transmitTime_uint64_t;
+  */
 
   // send the reply
   Udp.beginPacket(remoteIP, remotePort);
@@ -547,6 +523,21 @@ void setup() {
   // interrupt handler for the pulse-per-second pin
   pinMode(GPSPinPPS, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(GPSPinPPS), ppsHandlerRising, RISING);
+
+  Serial.print("Measuring time to read the clock (\"precision\")... ");
+  unsigned long clockReadTime = 1000000;
+  unsigned long before, after;
+  for (int i = 0; i < 10; i++) {
+    before = micros();
+    getCurrentTimeInNTP64BitFormat();
+    after = micros();
+    if (clockReadTime > (after - before)) {
+      clockReadTime = after - before;
+    }
+  }
+  double seconds = static_cast<double>(clockReadTime) / 1e6;
+  precision = static_cast<int8_t>(std::ceil(std::log2(seconds)));
+  Serial.println(String(clockReadTime) + "us, precision = " + String(precision));
 
   // create a mutex to be used to ensure an NTP request results are not impacted by the process that refreshes the time
   mutex = xSemaphoreCreateMutex();
