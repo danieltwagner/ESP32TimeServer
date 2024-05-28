@@ -30,7 +30,7 @@ String ip = "";
 // GPS
 TinyGPSPlus gps;
 #define GPSDevice Serial2
-volatile bool ppsFlag; // GPS one-pulse-per-second flag
+volatile unsigned long ppsRiseMicros; // The micros() of the last rising flag
 
 // TimeZone
 TimeChangeRule *tcr;
@@ -53,82 +53,34 @@ const time_t safeguardThresholdInSeconds = 1;                                   
 volatile bool didSetGPSTime;  // have we ever set time based on GPS?
 volatile int8_t precision;
 
+volatile unsigned long lastAdjustmentMicros = 0;
+volatile double lastDrift = 0;
+
 //
 SemaphoreHandle_t mutex;         // used to ensure an NTP request results are not impacted by the process that refreshes the time
                                  //
 TaskHandle_t taskHandle0 = NULL; // task handle for updating the display
 TaskHandle_t taskHandle1 = NULL; // task handle for setting/refreshing the time
 
-//**************************************************************************************************************************
-
-void display(uint8_t row, String msg, bool writeToSerialMonitor = true)
-{
-
-  // String displayLine = msg + fullyBlankLine; // adding the fully blank line here clears the remnants of previously displayed information
-  // displayLine = displayLine.substring(0, 20);
-
-  // lcd.setCursor(0, row);
-  // lcd.print(displayLine);
-
-  // if (debugIsOn && writeToSerialMonitor)
-  //   Serial.println(displayLine);
-  Serial.println(msg);
+unsigned long microsSinceLastAdjustment(unsigned long microsNow) {
+  // corner case: deal with micros wrapping
+  if (microsNow < lastAdjustmentMicros) {
+    return microsNow + (ULONG_MAX - lastAdjustmentMicros);
+  }
+  return microsNow - lastAdjustmentMicros;
 }
 
-void GetAdjustedDateAndTimeStrings(time_t UTC_Time, String &dateString, String &timeString)
-{
+long getDriftAdjustmentMicros() {
+  // exit if we don't have an adjustment or computed drift
+  if (lastAdjustmentMicros == 0 || lastDrift == 0) {
+    return 0;
+  }
 
-  // adjust utc time to local time
-  time_t now_Local_Time = myTZ.toLocal(UTC_Time, &tcr);
+  unsigned long deltaMicros = microsSinceLastAdjustment(micros());
+  return - lastDrift * (double)deltaMicros;
+}
 
-  // format dateLine
-
-  dateString = String(year(now_Local_Time));
-
-  dateString.concat("-");
-
-  if (month(now_Local_Time) < 10)
-    dateString.concat("0");
-
-  dateString.concat(String(month(now_Local_Time)));
-
-  dateString.concat("-");
-
-  if (day(now_Local_Time) < 10)
-    dateString.concat("0");
-
-  dateString.concat(String(day(now_Local_Time)));
-
-  // format timeLine
-
-  timeString = String(hourFormat12(now_Local_Time));
-
-  timeString.concat(":");
-
-  if (minute(now_Local_Time) < 10)
-    timeString.concat("0");
-
-  timeString.concat(String(minute(now_Local_Time)));
-
-  timeString.concat(":");
-
-  if (second(now_Local_Time) < 10)
-    timeString.concat("0");
-
-  timeString.concat(String(second(now_Local_Time)));
-
-  if (isAM(now_Local_Time))
-    timeString.concat(" AM ");
-  else
-    timeString.concat(" PM ");
-  
-  if (displayTimeZone)
-    timeString.concat(tcr -> abbrev);
-};
-
-String GetUpTime()
-{
-
+String getUptime() {
   unsigned long ms = millis();
 
   const int oneSecond = 1000;
@@ -158,132 +110,91 @@ String GetUpTime()
 }
 
 void setDateAndTimeFromGPS(void *parameter) {
-  static unsigned long lastAdjustmentMicros = 0;
-  static double lastPpmDrift = 0;
-
-  /// used below to ensure a GPS time refresh if is only performed if the difference between the old and new times is reasonable for the periodicTimeRefreshPeriod
-  const time_t safeguardThresholdHigh = safeguardThresholdInSeconds;
-  const time_t safeguardThresholdLow = -1 * safeguardThresholdInSeconds;
-
-  time_t candidateDateAndTime;
-
-  if (debugIsOn)
-    Serial.println("Start setDateAndTimeFromGPS task");
+  time_t gpsDateAndTime;
 
   while (true) {
-    // wait for the ppsFlag to be raised at the start of the 1st second
-    ppsFlag = false;
-    while (!ppsFlag) {
+
+    unsigned long lastPpsRise = ppsRiseMicros;
+    // wait for a new pps rising flag. This makes life a little easier later because we
+    // know we're at the start of a second rather than *just* before a new pulse arrives
+    while (ppsRiseMicros == lastPpsRise) {
       delay(10);
     }
 
-    if (gps.date.isValid() && gps.time.isValid()) {
-      struct tm wt;
-      wt.tm_year = gps.date.year();
-      wt.tm_mon = gps.date.month();
-      wt.tm_mday = gps.date.day();
-      wt.tm_hour = gps.time.hour();
-      wt.tm_min = gps.time.minute();
-      wt.tm_sec = gps.time.second();
+    // now wait until both date and time are more recent than the corresponding pulse
+    unsigned long ppmAge = (micros() - ppsRiseMicros)/1000;
+    bool updated = gps.date.age() < ppmAge && gps.time.age() < ppmAge;
+    while (!updated) {
+      delay(10);
+      ppmAge = (micros() - ppsRiseMicros)/1000;
+      updated = gps.date.age() < ppmAge && gps.time.age() < ppmAge;
+    }
+    unsigned long thisPpsRise = ppsRiseMicros;
 
-      wt.tm_year -= 1900;  // adjust year (see you again in 2036)
-      wt.tm_mon -= 1;      // adjust month (January is month 0)
+    struct tm wt;
+    wt.tm_year = gps.date.year() - 1900; // 1900 is year 0
+    wt.tm_mon = gps.date.month() - 1;    // January is month 0
+    wt.tm_mday = gps.date.day();
+    wt.tm_hour = gps.time.hour();
+    wt.tm_min = gps.time.minute();
+    wt.tm_sec = gps.time.second();
+    gpsDateAndTime = mktime(&wt);
 
-      // by the time the next pps pulse comes around it will be one second later
-      candidateDateAndTime = mktime(&wt) + 1;
+    struct timeval rtc_now;
+    gettimeofday(&rtc_now, NULL);
+    unsigned long microsAfterRTC = micros();
+
+    // At this point we have the pps rise time in micros as well as the corresponding GPS time.
+    // We also know our RTC time and when we took it, in micros.
+    time_t updateDelta = gpsDateAndTime - rtc_now.tv_sec;
+
+    // avoid changing date/time while an NTP request is being answered
+    if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+
+      // try again if a new PPS pulse has arrived since, as we'd be a second out from when we started
+      if (ppsRiseMicros != thisPpsRise) {
+        continue;
+      }
+
+      // set the real time clock, accounting for the extra micros that passed since we saw the PPS pulse
+      rtc.setTime(gpsDateAndTime, micros() - thisPpsRise);
+
+      // release the hold
+      xSemaphoreGive(mutex);
 
       if (debugIsOn) {
-        Serial.println("Received date and time " + String(wt.tm_year) + " " + String(wt.tm_mon) + " " + String(wt.tm_mday) + " " + String(wt.tm_hour) + " " + String(wt.tm_min) + " " + String(wt.tm_sec));
+        Serial.print("Date and time set to ");
+        String ws = rtc.getDateTime(true);
+        ws.trim();
+        Serial.println(ws + " (UTC)");
       }
 
-      // give some time to ensure the PPS pin is reset
-      vTaskDelay(200 / portTICK_PERIOD_MS);
+      if (didSetGPSTime) {
+        // calculate drift
+        unsigned long microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
+        unsigned long microsBetweenAdjustments = microsSinceLastAdjustment(microsAfterRTC);
+        time_t deltaMicros = (updateDelta * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
+        double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;;
 
-      // wait for the PPS flag to be raised (signifying the true start of the candidate time)
-      ppsFlag = false;
-      while (!ppsFlag) {
-        vTaskDelay(portTICK_PERIOD_MS/10);
-      }
-
-      unsigned long pegProcessingAdjustmentStartTime = micros();
-      struct timeval tv_now;
-      gettimeofday(&tv_now, NULL);
-      suseconds_t rtcMicrosAfterPPSFlag = tv_now.tv_usec;
-
-      // at this point:
-      // apply a sanity check; the current rtc time and the candidate time just taken from the gps readings which will be used to refresh the current rtc should be within a second of each other (safeguardThresholdInSeconds)
-      // if the sanity check fails, do not set the time and raise a Safeguard flag which be used to update the display to show the user the latest time refresh failed
-      // if the sanity check passes, proceed with refreshing the time and if the Safeguard flag been previously been raised then lower it
-
-      bool SanityCheckPassed;
-      time_t updateDelta;
-
-      if (!didSetGPSTime) {
-        SanityCheckPassed = true;
-      } else {
-        time_t currentRTC = tv_now.tv_sec;
-        updateDelta = candidateDateAndTime - currentRTC;
-        SanityCheckPassed = (((updateDelta >= safeguardThresholdLow) && (updateDelta <= safeguardThresholdHigh)));
-      }
-
-      if (SanityCheckPassed)
-      {
-
-        // place a hold on (the date and time) so if an NTP request is underway in the fraction of a second this code will take, the time and date values don't change mid way through that request.
-        if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE)
-        {
-
-          // set the date and time
-          unsigned long pegProcessingAdjustmentEndTime = micros();
-          unsigned long ProcessingAdjustment = pegProcessingAdjustmentEndTime - pegProcessingAdjustmentStartTime;
-
-          // set the real time clock
-          rtc.setTime((unsigned long)candidateDateAndTime, (int)ProcessingAdjustment);
-
-          // release the hold
-          xSemaphoreGive(mutex);
-
-          if (debugIsOn) {
-            Serial.print("Date and time set to ");
-            String ws = rtc.getDateTime(true);
-            ws.trim();
-            Serial.println(ws + " (UTC)");
-          }
-
-          if (didSetGPSTime) {
-            // calculate drift
-            unsigned long microsBetweenAdjustments = pegProcessingAdjustmentStartTime - lastAdjustmentMicros;
-            time_t deltaMicros = (updateDelta * 1000000) - rtcMicrosAfterPPSFlag;
-            double ppmDrift = ((double)deltaMicros / (double)microsBetweenAdjustments) * 1000000.0;
-
-            if (debugIsOn) {
-              Serial.println("rtcMicrosAfterPPSFlag = " + String(rtcMicrosAfterPPSFlag));
-              Serial.println("We adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
-              Serial.print(microsBetweenAdjustments);
-              Serial.print("us passed between adjustments. Clock drift is ");
-              Serial.print(ppmDrift);
-              Serial.print("ppm. Last run was ");
-              Serial.println(lastPpmDrift);
-            }
-
-            lastPpmDrift = ppmDrift;
-          }
-
-          lastAdjustmentMicros = pegProcessingAdjustmentStartTime;
-          didSetGPSTime = true;
-
-          // whew that was hard work but fun, lets take a break and then do it all again
-          vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
+        if (debugIsOn) {
+          Serial.println("Adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
+          Serial.print(microsBetweenAdjustments);
+          Serial.print("us passed between adjustments. Clock drift is ");
+          Serial.print(clockDrift * 1000000.0);
+          Serial.print("ppm. Last run was ");
+          Serial.print(lastDrift * 1000000.0);
+          Serial.println("ppm.");
+          Serial.println("When adjusting for drift we had a cumulative error of " + String(deltaMicros - microsBetweenAdjustments*lastDrift) + "us.");
         }
-        else
-        {
-          if (debugIsOn)
-          {
-            Serial.println("Could not refresh the time as a NTP request was underway");
-            Serial.println("Will try again");
-          }
-        }
+
+        lastDrift = clockDrift;
       }
+
+      lastAdjustmentMicros = microsAfterRTC;
+      didSetGPSTime = true;
+
+      // whew that was hard work but fun, lets take a break and then do it all again
+      vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
     }
   }
 }
@@ -298,24 +209,19 @@ void EthEvent(WiFiEvent_t event)
   {
   case ARDUINO_EVENT_ETH_START:
     ETH.setHostname("MasterClock");
-    display(rowOfDisplayToShowStatus, "Ethernet started");
     break;
   case ARDUINO_EVENT_ETH_CONNECTED:
-    display(rowOfDisplayToShowStatus, "Ethernet connected");
     eth_connected = true;
     break;
   case ARDUINO_EVENT_ETH_GOT_IP:
     ip = ETH.localIP().toString();
-    display(rowOfDisplayToShowIP, ip);
     eth_got_IP = true;
     eth_connected = true;
     break;
   case ARDUINO_EVENT_ETH_DISCONNECTED:
-    display(rowOfDisplayToShowStatus, "Ethernet disconnect");
     eth_connected = false;
     break;
   case ARDUINO_EVENT_ETH_STOP:
-    display(rowOfDisplayToShowStatus, "Ethernet stopped");
     eth_connected = false;
     break;
   default:
@@ -323,9 +229,7 @@ void EthEvent(WiFiEvent_t event)
   }
 }
 
-void setupEthernet()
-{
-
+void setupEthernet() {
   WiFi.onEvent(EthEvent);
   ETH.begin();
 
@@ -333,27 +237,28 @@ void setupEthernet()
     delay(1);
 }
 
-void startUDPSever()
-{
-
-  Udp.begin(NTP_PORT);
-}
-
-uint64_t getCurrentTimeInNTP64BitFormat()
-{
+uint64_t getCurrentTimeInNTP64BitFormat() {
   const uint64_t secsBetween1900and1970 = 2208988800;
 
   struct timeval tv_now;
   gettimeofday(&tv_now, NULL);
+
+  // use our last observed clock drift to improve accuracy
+  suseconds_t adjusted_usec = tv_now.tv_usec + getDriftAdjustmentMicros();
+  time_t adjusted_sec = tv_now.tv_sec;
+  if (adjusted_usec < 0) {
+    adjusted_usec += 1000000;
+    adjusted_sec -= 1;
+  }
   
-  uint64_t seconds = (uint64_t)tv_now.tv_sec + secsBetween1900and1970;
-  uint64_t fraction = (uint64_t)((double)(tv_now.tv_usec + 1) * (double)(1LL << 32) * 1.0e-6);
+  // See https://tickelton.gitlab.io/articles/ntp-timestamps/
+  uint64_t seconds = (uint64_t)adjusted_sec + secsBetween1900and1970;
+  uint64_t fraction = (uint64_t)((double)(adjusted_usec + 1) * (double)(1LL << 32) * 1.0e-6);
   return (seconds << 32) | fraction;
 }
 
 // send NTP reply
-void sendNTPpacket(IPAddress remoteIP, int remotePort)
-{
+void sendNTPpacket(IPAddress remoteIP, int remotePort) {
 
   // set the receive time to the current time
   uint64_t receiveTime_uint64_t = getCurrentTimeInNTP64BitFormat();
@@ -456,13 +361,11 @@ void sendNTPpacket(IPAddress remoteIP, int remotePort)
   Udp.endPacket();
 }
 
-void processNTPRequests()
-{
+void processNTPRequests() {
 
   unsigned long replyStartTime = micros();
 
   int packetSize = Udp.parsePacket();
-
   if (packetSize == NTP_PACKET_SIZE) // an NTP request has arrived
   {
 
@@ -479,21 +382,15 @@ void processNTPRequests()
       // send NTP reply
       sendNTPpacket(remoteIP, Udp.remotePort());
       xSemaphoreGive(mutex);
-    };
+    }
 
     // report query in serial monitor
     // note: unlike other serial monitor writes in this sketch, this particular write is on the critical path for processing NTP requests.
     // while it does not delay the response to an initial NTP request, if subsequent NTP requests are queued up to run directly afterward
     // this serial monitor write will delay responding to the queued request by approximately 1 milli second.
-    if (debugIsOn)
-    {
-
-      String dateLine = "";
-      String timeLine = "";
-      GetAdjustedDateAndTimeStrings(rtc.getEpoch(), dateLine, timeLine);
-      String updatemessage = "Query from " + remoteIP.toString() + " on " + dateLine + " at " + timeLine;
-      Serial.println(updatemessage);
-    };
+    if (debugIsOn) {
+      Serial.println("Query from " + remoteIP.toString());
+    }
   }
   else
   {
@@ -502,13 +399,13 @@ void processNTPRequests()
       Udp.flush(); // not sure what this incoming packet is, but it is not an ntp request so get rid of it
       if (debugIsOn)
         Serial.println("Invalid request received on port " + String(NTP_PORT) + ", length =" + String(packetSize));
-    };
-  };
+    }
+  }
 }
 
 void ppsHandlerRising()
-{                 // PPS interrupt handler
-  ppsFlag = true; // raise the flag that signals the start of the next second
+{
+  ppsRiseMicros = micros();
 }
 
 void setup() {
@@ -569,7 +466,7 @@ void setup() {
 
   Serial.println("Setting up networking");
   setupEthernet();
-  startUDPSever();
+  Udp.begin(NTP_PORT);
 
   Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
 }
