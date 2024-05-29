@@ -455,31 +455,6 @@ bool checkForValidGPSSentence() {
   return false;
 }
 
-bool configureGPS() {
-  Serial.print("Opening GPS with 9600 baud... ");
-  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
-
-  // wait for at least one valid sentence
-  if (!checkForValidGPSSentence()) {
-    Serial.print("fail. Trying 115200 baud... ");
-  } else {
-    // send the command to 
-    Serial.print("success! Configuring 115200 baud...");
-    GPSDevice.write(switchTo115200, sizeof(switchTo115200));
-  }
-  delay(100);
-  GPSDevice.end();
-
-  GPSDevice.begin(115200, SERIAL_8N1, GPSPinRX, GPSPinTX);
-  if (!checkForValidGPSSentence()) {
-    Serial.println("fail. Check GPS connection.");
-    return false;
-  }
-
-  Serial.println("success!");
-  return true;
-}
-
 void setup() {
   Serial.begin(SerialMonitorSpeed);
   Serial.println("ESP32 Time Server starting");
@@ -508,12 +483,47 @@ void setup() {
   precision = static_cast<int8_t>(std::ceil(std::log2(seconds)));
   Serial.println(String(clockReadTime) + "us, precision = " + String(precision));
 
+  Serial.println("Setting up networking");
+  setupEthernet();
+
+  // Web server and OTA
+  server.on("/", []() {
+    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Max drift: " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
+  });
+  ElegantOTA.begin(&server); // serves /update
+  server.begin();
+
   // create a mutex to be used to ensure an NTP request results are not impacted by the process that refreshes the time
   mutex = xSemaphoreCreateMutex();
 
   // Configure GPS to 115200 baud
-  while(!configureGPS()) {
-    delay(1000);
+  Serial.print("Opening GPS with 9600 baud... ");
+  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
+
+  // // wait for at least one valid sentence
+  // if (!checkForValidGPSSentence()) {
+  //   Serial.print("fail. Trying 115200 baud... ");
+  // } else {
+  //   // send the command to 
+  //   Serial.print("success! Configuring 115200 baud...");
+  //   GPSDevice.write(switchTo115200, sizeof(switchTo115200));
+  // }
+  // delay(100);
+  // GPSDevice.end();
+
+  // GPSDevice.begin(115200, SERIAL_8N1, GPSPinRX, GPSPinTX);
+  if (!checkForValidGPSSentence()) {
+    Serial.println("fail. Check GPS connection.");
+
+    // loop for 60s so we don't get locked out of the firmware updater
+    unsigned long start = millis();
+    while (millis() - start < 60000) {
+      server.handleClient();
+    }
+    ESP.restart();
+
+  } else {
+    Serial.println("success!");
   }
 
   // set up periodic date/time task
@@ -536,17 +546,7 @@ void setup() {
     delay(10);
   }
 
-  Serial.println("Setting up networking");
-  setupEthernet();
   Udp.begin(NTP_PORT);
-
-  // Web server and OTA
-  server.on("/", []() {
-    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Max drift: " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
-  });
-  ElegantOTA.begin(&server); // serves /update
-  server.begin();
-
   Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
 }
 
