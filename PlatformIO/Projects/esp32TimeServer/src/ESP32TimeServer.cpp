@@ -41,14 +41,21 @@ TimeChangeRule *tcr;
 byte packetBuffer[NTP_PACKET_SIZE];
 WiFiUDP Udp;
 
-// Constants and global variables
-const unsigned long oneSecond_inMilliseconds = 1000;                              // one second in milliseconds
-const unsigned long oneMinute_inMilliseconds = 60 * oneSecond_inMilliseconds;     // one minute in milliseconds
-const long oneSecond_inMicroseconds_L = 1000000;                                  // one second in microseconds (signed long)
-const double oneSecond_inMicroseconds_D = 1000000.0;                              // one second in microseconds (double)
-                                                                                  //
-const unsigned long periodicTimeRefreshPeriod = oneMinute_inMilliseconds;         // how often the system's real time clock is refreshed with GPS data
-const time_t safeguardThresholdInSeconds = 1;                                     // used to ensure a GPS time refresh is only performed if the difference between the old and new times is this many seconds or less
+const byte switchTo115200[] = {
+  0xB5, 0x62, // Sync chars
+  0x06, 0x00, // Message class and ID
+  0x14, 0x00, // Payload length (20 bytes)
+  0x01, 0x00, // portID = 1, reserved0 = 0
+  0x00, 0x00, // txReady
+  0xD0, 0x08, 0x00, 0x00, // mode
+  0x00, 0xC2, 0x01, 0x00, // baudRate (115200 in little-endian)
+  0x07, 0x00, // inProtoMask
+  0x07, 0x00, // outProtoMask
+  0x00, 0x00, // flags
+  0x00, 0x00, // reserved5
+  0xC4, 0x96  // checksum (CK_A, CK_B)
+};
+
 
 volatile bool didSetGPSTime;  // have we ever set time based on GPS?
 volatile int8_t precision;
@@ -167,7 +174,7 @@ void setDateAndTimeFromGPS(void *parameter) {
         Serial.print("Date and time set to ");
         String ws = rtc.getDateTime(true);
         ws.trim();
-        Serial.println(ws + " (UTC)");
+        Serial.println(ws + " (UTC). We used " + String(gps.satellites.value()) + " satellites.");
       }
 
       if (didSetGPSTime) {
@@ -191,7 +198,7 @@ void setDateAndTimeFromGPS(void *parameter) {
         }
         
         if (debugIsOn) {
-          Serial.println("Adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
+          Serial.println("Adjusted the clock by adding " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
           Serial.print(microsBetweenAdjustments);
           Serial.print("us passed between adjustments. Clock drift is ");
           Serial.print(clockDrift * 1000000.0);
@@ -210,7 +217,7 @@ void setDateAndTimeFromGPS(void *parameter) {
       numSyncs++;
 
       // whew that was hard work but fun, lets take a break and then do it all again
-      vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
+      vTaskDelay(60000 / portTICK_PERIOD_MS);
     }
   }
 }
@@ -425,9 +432,47 @@ void processNTPRequests() {
   }
 }
 
-void ppsHandlerRising()
-{
+void ppsHandlerRising() {
   ppsRiseMicros = micros();
+}
+
+bool checkForValidGPSSentence() {
+  gps.encode('$');
+  unsigned long start = millis();
+  while (millis() < start + 2000) {
+    while (GPSDevice.available()) {
+      if(gps.encode(GPSDevice.read())) {
+        return true;
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+bool configureGPS() {
+  Serial.print("Opening GPS with 9600 baud... ");
+  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
+
+  // wait for at least one valid sentence
+  if (!checkForValidGPSSentence()) {
+    Serial.print("fail. Trying 115200 baud... ");
+  } else {
+    // send the command to 
+    Serial.print("success! Configuring 115200 baud...");
+    GPSDevice.write(switchTo115200, sizeof(switchTo115200));
+  }
+  delay(100);
+  GPSDevice.end();
+
+  GPSDevice.begin(115200, SERIAL_8N1, GPSPinRX, GPSPinTX);
+  if (!checkForValidGPSSentence()) {
+    Serial.println("fail. Check GPS connection.");
+    return false;
+  }
+
+  Serial.println("success!");
+  return true;
 }
 
 void setup() {
@@ -461,10 +506,10 @@ void setup() {
   // create a mutex to be used to ensure an NTP request results are not impacted by the process that refreshes the time
   mutex = xSemaphoreCreateMutex();
 
-  Serial.println("Opening GPS with 9600 baud");
-  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
-
-  // TODO: Switch to 115k2 baud?
+  // Configure GPS to 115200 baud
+  while(!configureGPS()) {
+    delay(1000);
+  }
 
   // set up periodic date/time task
   xTaskCreatePinnedToCore(

@@ -9,7 +9,6 @@
 // GPS  
 const int GPSPinRX = 5, GPSPinTX = 17;            // RX and TX pins on the ESP32 board (The ESP32's RX pin is connected to the GPS's TX pin, and the ESP32's TX pin is connected to the GPS's RX pin)
 const int GPSPinPPS = 33;                         // PPS pin on the ESP32 board
-const uint32_t GPSBaud = 115200;                  // desired GPS baud 
 
 // LCD  
 const int lcdI2CAddress = 0x27;                   // lcd I2C address; if you don't know your display address, run an I2C scanner sketch
