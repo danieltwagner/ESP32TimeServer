@@ -17,6 +17,8 @@
 #include <Timezone.h>
 #include <ESP32Time.h>
 #include <TinyGPSPlus.h>
+#include <ElegantOTA.h>
+
 #include "ESP32TimeServerKeySettings.h"
 
 // ESP32Time real time clock
@@ -26,6 +28,9 @@ ESP32Time rtc(0);
 bool eth_connected = false;
 bool eth_got_IP = false;
 String ip = "";
+
+// Web server for OTA
+WebServer server(80);
 
 // GPS
 TinyGPSPlus gps;
@@ -110,7 +115,7 @@ String getUptime() {
 
   char buffer[21];
 
-  sprintf(buffer, "%d %02d:%02d:%02d", numberOfDays, numberOfHours, numberOfMinutes, numberOfSeconds);
+  sprintf(buffer, "%d days %02d:%02d:%02d", numberOfDays, numberOfHours, numberOfMinutes, numberOfSeconds);
 
   returnValue = String(buffer);
   return returnValue;
@@ -535,6 +540,13 @@ void setup() {
   setupEthernet();
   Udp.begin(NTP_PORT);
 
+  // Web server and OTA
+  server.on("/", []() {
+    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Max drift: " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
+  });
+  ElegantOTA.begin(&server); // serves /update
+  server.begin();
+
   Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
 }
 
@@ -545,4 +557,5 @@ void loop()
     }
   }
   processNTPRequests();
+  server.handleClient();
 }
