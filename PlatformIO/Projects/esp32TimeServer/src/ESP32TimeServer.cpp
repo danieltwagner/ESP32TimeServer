@@ -55,8 +55,8 @@ volatile int8_t precision;
 
 volatile unsigned long lastAdjustmentMicros = 0;
 volatile double lastDrift = 0;
+volatile uint32_t maxObservedDrift = 0; // pre-computed field used as part of the NTP message
 
-//
 SemaphoreHandle_t mutex;         // used to ensure an NTP request results are not impacted by the process that refreshes the time
                                  //
 TaskHandle_t taskHandle0 = NULL; // task handle for updating the display
@@ -111,6 +111,7 @@ String getUptime() {
 
 void setDateAndTimeFromGPS(void *parameter) {
   time_t gpsDateAndTime;
+  long numSyncs = 0;
 
   while (true) {
 
@@ -174,8 +175,21 @@ void setDateAndTimeFromGPS(void *parameter) {
         unsigned long microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
         unsigned long microsBetweenAdjustments = microsSinceLastAdjustment(microsAfterRTC);
         time_t deltaMicros = (updateDelta * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
-        double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;;
+        double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
 
+        // how close was the previous drift adjustment?
+        double thisErrorMicros = deltaMicros - microsBetweenAdjustments*lastDrift;
+        
+        // Pre-compute fixed-point format for use in the NTP message
+        if (numSyncs > 1) { // skip the first two runs so we only count drift-adjusted numbers
+
+          // conver to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
+          uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(thisErrorMicros) * 1e-6 * (1 << 16)));
+          if ((lastDrift > 0) && (fixedPointValue > maxObservedDrift)) {
+            maxObservedDrift = fixedPointValue;
+          }
+        }
+        
         if (debugIsOn) {
           Serial.println("Adjusted the clock by " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
           Serial.print(microsBetweenAdjustments);
@@ -184,7 +198,8 @@ void setDateAndTimeFromGPS(void *parameter) {
           Serial.print("ppm. Last run was ");
           Serial.print(lastDrift * 1000000.0);
           Serial.println("ppm.");
-          Serial.println("When adjusting for drift we had a cumulative error of " + String(deltaMicros - microsBetweenAdjustments*lastDrift) + "us.");
+
+          Serial.println("When adjusting for drift we had a cumulative error of " + String(thisErrorMicros) + "us.");
         }
 
         lastDrift = clockDrift;
@@ -192,6 +207,7 @@ void setDateAndTimeFromGPS(void *parameter) {
 
       lastAdjustmentMicros = microsAfterRTC;
       didSetGPSTime = true;
+      numSyncs++;
 
       // whew that was hard work but fun, lets take a break and then do it all again
       vTaskDelay(periodicTimeRefreshPeriod / portTICK_PERIOD_MS);
@@ -273,26 +289,32 @@ void sendNTPpacket(IPAddress remoteIP, int remotePort) {
   // Stratum, or type of clock
   packetBuffer[1] = 0b00000001;
 
-  // Polling Interval
-  packetBuffer[2] = 4;
+  // Polling Interval (2^x seconds)
+  packetBuffer[2] = 6;
 
-  // Peer Clock Precision
-  // log2(sec)
-  // 0xF6 <--> -10 <--> 0.0009765625 s
-  // 0xF7 <--> -9 <--> 0.001953125 s
-  // 0xF8 <--> -8 <--> 0.00390625 s
-  // 0xF9 <--> -7 <--> 0.0078125 s
-  // 0xFA <--> -6 <--> 0.0156250 s
-  // 0xFB <--> -5 <--> 0.0312500 s
+  // Peer Clock Precision: log2(sec) 
   packetBuffer[3] = precision;
 
-  // 8 bytes for Root Delay & Root Dispersion
-  packetBuffer[11] = 0x50;
+  // bytes 4..7 = root delay
+  // The value is a 32-bit signed fixed-point number in units of seconds,
+  // with the fraction point between bits 15 and 16.
+  // ES32 interrupts seem to take about 2us, which rounds to 0
+
+
+  // bytes 8..11 = root dispersion
+  // The value is a 32-bit signed fixed-point number in units of seconds,
+  // with the fraction point between bits 15 and 16.
+  // We use the maximum error observed once drift adjustment happens.
+  packetBuffer[8] = (int)((maxObservedDrift >> 24) & 0xFF);
+  packetBuffer[9] = (int)((maxObservedDrift >> 16) & 0xFF);
+  packetBuffer[10] = (int)((maxObservedDrift >> 8) & 0xFF);
+  packetBuffer[11] = (int)(maxObservedDrift & 0xFF);
 
   // time source (namestring)
   packetBuffer[12] = 71; // G
   packetBuffer[13] = 80; // P
   packetBuffer[14] = 83; // S
+  packetBuffer[15] = 0;
 
    // get the current time and write it out as the reference time to bytes 16 to 23 of the response packet
   uint64_t referenceTime_uint64_t = getCurrentTimeInNTP64BitFormat();
