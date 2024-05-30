@@ -8,21 +8,30 @@
 // https://time.is may be used a reference point to confirm your computer's date/time accuracy
 //
 
-// board: WT32-ETH01 with Neo6M GPS
-// GPS RX pin connected to GPIO17 on the ESP32
-// GPS TX pin connected to GPIO5 on the ESP32
-// GPS PPS pin connected to GPIO33 on the ESP32
+// board: WT32-ETH01
+// Neo6M GPS or similar
+const int pinGPSrx = 5;  // GPIO 5 is used to receive from GPS (connect to GPS TX pin)
+const int pinGPStx = 17; // GPIO 17 is used to transmit to GPS (connect to GPS RX pin)
+const int pinGPSpps = 33; // GPIO 33 reads the PPS pulse  
+
+// SSD1306 I2C 128x64 OLED display
+const int pinDisplaySda = 15; // Display SDA connected to GPIO15
+const int pinDisplayScl = 14; // Display SCL connected to GPIO14
 
 #include <ETH.h>
 #include <Timezone.h>
 #include <ESP32Time.h>
 #include <TinyGPSPlus.h>
 #include <ElegantOTA.h>
+#include <U8g2lib.h>
 
-#include "ESP32TimeServerKeySettings.h"
+bool debugIsOn = true;
 
 // ESP32Time real time clock
 ESP32Time rtc(0);
+
+// Display setup. We can afford to spend 1K on a full frame buffer.
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, pinDisplayScl, pinDisplaySda);
 
 // Ethernet
 bool eth_connected = false;
@@ -36,9 +45,6 @@ WebServer server(80);
 TinyGPSPlus gps;
 #define GPSDevice Serial2
 volatile unsigned long ppsRiseMicros; // The micros() of the last rising flag
-
-// TimeZone
-TimeChangeRule *tcr;
 
 // NTP port and packet buffer
 #define NTP_PORT 123
@@ -66,6 +72,7 @@ volatile bool didSetGPSTime;  // have we ever set time based on GPS?
 volatile int8_t precision;
 
 volatile unsigned long lastAdjustmentMicros = 0;
+volatile double lastErrorMicros;
 volatile double lastDrift = 0;
 volatile uint32_t maxObservedDrift = 0; // pre-computed field used as part of the NTP message
 
@@ -190,14 +197,14 @@ void setDateAndTimeFromGPS(void *parameter) {
         double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
 
         // how close was the previous drift adjustment?
-        double thisErrorMicros = deltaMicros - microsBetweenAdjustments*lastDrift;
+        lastErrorMicros = deltaMicros - microsBetweenAdjustments*lastDrift;
         
         // Pre-compute fixed-point format for use in the NTP message
         if (numSyncs > 1) { // skip the first two runs so we only count drift-adjusted numbers
 
-          // conver to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
-          uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(thisErrorMicros) * 1e-6 * (1 << 16)));
-          if ((lastDrift > 0) && (fixedPointValue > maxObservedDrift)) {
+          // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
+          uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
+          if (fixedPointValue > maxObservedDrift) {
             maxObservedDrift = fixedPointValue;
           }
         }
@@ -211,7 +218,7 @@ void setDateAndTimeFromGPS(void *parameter) {
           Serial.print(lastDrift * 1000000.0);
           Serial.println("ppm.");
 
-          Serial.println("When adjusting for drift we had a cumulative error of " + String(thisErrorMicros) + "us.");
+          Serial.println("When adjusting for drift we had a cumulative error of " + String(lastErrorMicros) + "us.");
         }
 
         lastDrift = clockDrift;
@@ -455,18 +462,70 @@ bool checkForValidGPSSentence() {
   return false;
 }
 
+void drawLineCentered(const char *line, uint8_t yOffset) {
+  u8g2_uint_t width = u8g2.getUTF8Width(line);
+  u8g2.drawStr((u8g2.getDisplayWidth()-width)/2, u8g2.getDisplayHeight()/2 + yOffset, line);
+}
+
+void displayCentered(const char *line1, const char *line2 = NULL) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_helvR10_tr);
+  u8g2.setFontPosCenter();
+  if (line2 == NULL) {
+    drawLineCentered(line1, 0);
+  } else {
+    uint8_t offset = u8g2.getMaxCharHeight()/2;
+    drawLineCentered(line1, -offset);
+    drawLineCentered(line2, offset);
+  }
+  u8g2.sendBuffer();
+}
+
+void displayInfo(void *param) {
+  // Thursday, May 30 2024
+  // <big> 09:50:26 UTC </big>
+  // Drift: 123us, max: 1234us
+  // Sats: 12, Last fix: 1234.56s
+  // uptime: 123 days 12:34:56
+
+  while (true) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_originalsans_tr);
+    uint8_t lineHeight = u8g2.getMaxCharHeight();
+    u8g2.setFontPosTop();
+    u8g2.drawStr(0, 0, rtc.getDate(true).c_str());
+    u8g2.setFont(u8g2_font_helvB14_tr);
+    u8g2.drawStr(0, lineHeight+1, (rtc.getTime() + " UTC").c_str());
+
+    u8g2.setFont(u8g2_font_originalsans_tr);
+    float maxDriftMicros = (static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6;
+    u8g2.drawStr(0, 3*lineHeight-2,("Drift: " + String(int(ceil(lastErrorMicros))) + "us, max: " + String(int(ceil(maxDriftMicros))) + "us").c_str());
+    u8g2.drawStr(0, 4*lineHeight-2, ("Sats: " + String(gps.satellites.value()) + ", Last fix: " + String(gps.time.age()/1000.0) + "s").c_str());
+    u8g2.drawStr(0, 5*lineHeight-2, ("Uptime: " + getUptime()).c_str());
+    u8g2.sendBuffer();
+
+    struct timeval rtc_now;
+    gettimeofday(&rtc_now, NULL);
+    unsigned long nextFullSec = (1000000 - rtc_now.tv_usec) / 1000;
+    vTaskDelay(nextFullSec / portTICK_PERIOD_MS);
+  }
+}
+
 void setup() {
-  Serial.begin(SerialMonitorSpeed);
+  Serial.begin(115200);
   Serial.println("ESP32 Time Server starting");
 
+  u8g2.begin();
+  displayCentered("ESP32 Time Server");  
+  
   // wifi and bluetooth aren't needed so turn them off
   Serial.println("Disabling wifi and bluetooth");
   WiFi.mode(WIFI_OFF);
   btStop();
 
   // interrupt handler for the pulse-per-second pin
-  pinMode(GPSPinPPS, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(GPSPinPPS), ppsHandlerRising, RISING);
+  pinMode(pinGPSpps, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(pinGPSpps), ppsHandlerRising, RISING);
 
   Serial.print("Measuring time to read the clock (\"precision\")... ");
   unsigned long clockReadTime = 1000000;
@@ -488,7 +547,7 @@ void setup() {
 
   // Web server and OTA
   server.on("/", []() {
-    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Max drift: " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
+    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Last drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
   });
   ElegantOTA.begin(&server); // serves /update
   server.begin();
@@ -498,7 +557,7 @@ void setup() {
 
   // Configure GPS to 115200 baud
   Serial.print("Opening GPS with 9600 baud... ");
-  GPSDevice.begin(9600, SERIAL_8N1, GPSPinRX, GPSPinTX);
+  GPSDevice.begin(9600, SERIAL_8N1, pinGPSrx, pinGPStx);
 
   // // wait for at least one valid sentence
   // if (!checkForValidGPSSentence()) {
@@ -511,9 +570,10 @@ void setup() {
   // delay(100);
   // GPSDevice.end();
 
-  // GPSDevice.begin(115200, SERIAL_8N1, GPSPinRX, GPSPinTX);
+  // GPSDevice.begin(115200, SERIAL_8N1, pinGPSrx, pinGPStx);
   if (!checkForValidGPSSentence()) {
     Serial.println("fail. Check GPS connection.");
+    displayCentered("GPS failed");
 
     // loop for 60s so we don't get locked out of the firmware updater
     unsigned long start = millis();
@@ -526,25 +586,38 @@ void setup() {
     Serial.println("success!");
   }
 
-  // set up periodic date/time task
-  xTaskCreatePinnedToCore(
+  // set up task for gps time
+  xTaskCreate(
     setDateAndTimeFromGPS,
     "Set Date and Time from GPS",
     3000,
     NULL,
-    20, // task priority must be reasonably high or the queues from which the gps data is drawn will not be adequately replenished
-    &taskHandle1,
-    0 // core 1 handles setup() and loop()
+    20, // reasonably high priority, we do want to keep time after all
+    &taskHandle0
   );
 
   // wait until the time is actually set
   Serial.println("Waiting for GPS time...");
+  displayCentered("Acquiring GPS");
   while (!didSetGPSTime) {
     while (GPSDevice.available()) {
       gps.encode(GPSDevice.read());
+      if(gps.satellites.isUpdated()) {
+        displayCentered("Acquiring GPS", (String(gps.satellites.value()) + " sats").c_str());
+      }
     }
     delay(10);
   }
+
+  // set up task for updating the display
+  xTaskCreate(
+    displayInfo,
+    "displayInfo",
+    3000,
+    NULL,
+    5, // not as important
+    &taskHandle1
+  );
 
   Udp.begin(NTP_PORT);
   Serial.println("ESP32 Time Server setup complete - listening for NTP requests now");
@@ -553,8 +626,7 @@ void setup() {
 void loop()
 {
   while (GPSDevice.available()) {
-    if(gps.encode(GPSDevice.read())) {
-    }
+    gps.encode(GPSDevice.read());
   }
   processNTPRequests();
   server.handleClient();
