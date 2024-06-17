@@ -462,22 +462,16 @@ bool checkForValidGPSSentence() {
   return false;
 }
 
-void drawLineCentered(const char *line, uint8_t yOffset) {
+void drawLineCentered(const char *line, int8_t yOffset) {
+  u8g2.setFont(u8g2_font_helvR10_tr);
+  u8g2.setFontPosCenter();
   u8g2_uint_t width = u8g2.getUTF8Width(line);
   u8g2.drawStr((u8g2.getDisplayWidth()-width)/2, u8g2.getDisplayHeight()/2 + yOffset, line);
 }
 
-void displayCentered(const char *line1, const char *line2 = NULL) {
+void displayCentered(const char *line) {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_helvR10_tr);
-  u8g2.setFontPosCenter();
-  if (line2 == NULL) {
-    drawLineCentered(line1, 0);
-  } else {
-    uint8_t offset = u8g2.getMaxCharHeight()/2;
-    drawLineCentered(line1, -offset);
-    drawLineCentered(line2, offset);
-  }
+  drawLineCentered(line, 0);
   u8g2.sendBuffer();
 }
 
@@ -547,7 +541,11 @@ void setup() {
 
   // Web server and OTA
   server.on("/", []() {
-    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Last drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Satellites: " + gps.satellites.value());
+    if(didSetGPSTime) {
+      server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Last drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Fix satellites: " + gps.satellites.value() + "</br>Satellites visible: " + gps.satellitesStats.nrSatsVisible() + " Satellites tracked: " + gps.satellitesStats.nrSatsTracked());
+    } else {
+      server.send(200, "text/html", "Acquiring gps...</br>Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
+    }
   });
   ElegantOTA.begin(&server); // serves /update
   server.begin();
@@ -573,7 +571,7 @@ void setup() {
   // GPSDevice.begin(115200, SERIAL_8N1, pinGPSrx, pinGPStx);
   if (!checkForValidGPSSentence()) {
     Serial.println("fail. Check GPS connection.");
-    displayCentered("GPS failed");
+    displayCentered("Check GPS");
 
     // loop for 60s so we don't get locked out of the firmware updater
     unsigned long start = millis();
@@ -602,11 +600,16 @@ void setup() {
   while (!didSetGPSTime) {
     while (GPSDevice.available()) {
       gps.encode(GPSDevice.read());
-      if(gps.satellites.isUpdated()) {
-        displayCentered("Acquiring GPS", (String(gps.satellites.value()) + " sats").c_str());
+      if(gps.satellitesStats.isUpdated()) {
+        u8g2.clearBuffer();
+        drawLineCentered("Acquiring GPS", -16);
+        drawLineCentered((String(gps.satellitesStats.nrSatsVisible()) + " visible, " + String(gps.satellitesStats.nrSatsTracked()) + " tracked").c_str(), 0);
+        drawLineCentered(getUptime().c_str(), 16);
+        u8g2.sendBuffer();
       }
     }
-    delay(10);
+    delay(10); // keep the watchdog happy
+    server.handleClient(); // ensure we can reach the http interface
   }
 
   // set up task for updating the display
