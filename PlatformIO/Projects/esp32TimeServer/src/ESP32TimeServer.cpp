@@ -81,6 +81,10 @@ SemaphoreHandle_t mutex;         // used to ensure an NTP request results are no
 TaskHandle_t taskHandle0 = NULL; // task handle for updating the display
 TaskHandle_t taskHandle1 = NULL; // task handle for setting/refreshing the time
 
+String nmeaCurrSentence;
+std::vector<String> lastSentences;
+
+
 unsigned long microsSinceLastAdjustment(unsigned long microsNow) {
   // corner case: deal with micros wrapping
   if (microsNow < lastAdjustmentMicros) {
@@ -505,6 +509,54 @@ void displayInfo(void *param) {
   }
 }
 
+// Read from GPS and accumulate sentences in a vector buffer
+bool readGPS() {
+  char c = GPSDevice.read();
+  nmeaCurrSentence += c;
+  if (gps.encode(c)) {
+    if (nmeaCurrSentence.indexOf("GLL") >= 0) {
+      // GLL seems to be the last of a set of sentences.
+      // find any previous GLL sentence and remove it and anything before.
+      std::vector<String>::iterator it = lastSentences.begin(), end = lastSentences.end();
+      for (; it != end; ++it) {
+        if ((*it).indexOf("GLL") > 0) {
+          lastSentences.erase(lastSentences.begin(), it+1);
+          break;
+        }
+      }
+    }
+    lastSentences.push_back(nmeaCurrSentence);
+    nmeaCurrSentence = "";
+    return true;
+  }
+  return false;
+}
+
+void handleWebRequest() {
+  // This allows us to keep outputting NMEA sentences without 
+  // constructing the string or computing the length first.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+
+  if(didSetGPSTime) {
+    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>");
+    server.sendContent("drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>");
+    server.sendContent("Uptime: " + String(getUptime()) + "</br>");
+    server.sendContent("Fix satellites: " + String(gps.satellites.value()) + "</br>");
+  } else {
+    server.send(200, "text/html", "Acquiring gps...</br>");
+  }
+
+  server.sendContent("Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
+  server.sendContent("</br></br>Last NMEA sentences:</br></br>");
+  std::vector<String>::iterator it = lastSentences.begin(), end = lastSentences.end();
+  for (; it != end; ++it) {
+    server.sendContent(*it + "</br>");
+  }
+  
+  // This tells the client to disconnect
+  server.sendContent("");
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32 Time Server starting");
@@ -540,13 +592,7 @@ void setup() {
   setupEthernet();
 
   // Web server and OTA
-  server.on("/", []() {
-    if(didSetGPSTime) {
-      server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>Last drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>Uptime: " + String(getUptime()) + "</br>Fix satellites: " + gps.satellites.value() + "</br>Satellites visible: " + gps.satellitesStats.nrSatsVisible() + " Satellites tracked: " + gps.satellitesStats.nrSatsTracked());
-    } else {
-      server.send(200, "text/html", "Acquiring gps...</br>Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
-    }
-  });
+  server.on("/", handleWebRequest);
   ElegantOTA.begin(&server); // serves /update
   server.begin();
 
@@ -597,9 +643,13 @@ void setup() {
   // wait until the time is actually set
   Serial.println("Waiting for GPS time...");
   displayCentered("Acquiring GPS");
+
   while (!didSetGPSTime) {
     while (GPSDevice.available()) {
-      gps.encode(GPSDevice.read());
+      if(readGPS()) {
+        // output the sentence that just finished
+        Serial.print(lastSentences.back());
+      }
       if(gps.satellitesStats.isUpdated()) {
         u8g2.clearBuffer();
         drawLineCentered("Acquiring GPS", -16);
@@ -629,7 +679,7 @@ void setup() {
 void loop()
 {
   while (GPSDevice.available()) {
-    gps.encode(GPSDevice.read());
+    readGPS();
   }
   processNTPRequests();
   server.handleClient();
