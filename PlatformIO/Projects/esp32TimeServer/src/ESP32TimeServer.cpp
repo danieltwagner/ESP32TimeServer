@@ -71,6 +71,7 @@ const byte switchTo115200[] = {
 volatile bool didSetGPSTime;  // have we ever set time based on GPS?
 volatile int8_t precision;
 
+volatile unsigned long maxAdjustmentGapMicros = 0;
 volatile unsigned long lastAdjustmentMicros = 0;
 volatile double lastErrorMicros;
 volatile double lastDrift = 0;
@@ -82,7 +83,7 @@ TaskHandle_t taskHandle0 = NULL; // task handle for updating the display
 TaskHandle_t taskHandle1 = NULL; // task handle for setting/refreshing the time
 
 String nmeaCurrSentence;
-std::vector<String> lastSentences;
+std::vector<String> lastNmeaSentences;
 
 
 unsigned long microsSinceLastAdjustment(unsigned long microsNow) {
@@ -145,13 +146,20 @@ void setDateAndTimeFromGPS(void *parameter) {
       delay(10);
     }
 
-    // now wait until both date and time are more recent than the corresponding pulse
-    unsigned long ppmAge = (micros() - ppsRiseMicros)/1000;
-    bool updated = gps.date.age() < ppmAge && gps.time.age() < ppmAge;
-    while (!updated) {
+    // Now wait until both date and time are more recent than the corresponding pulse.
+    // Note that date is only updated as part of the RMC sentence, along with time and
+    // location (location only if we have a valid fix), so we can just check for date.
+    unsigned long ppsAgeMicros = (micros() - ppsRiseMicros)/1000;
+    while (gps.date.age() > ppsAgeMicros) {
       delay(10);
-      ppmAge = (micros() - ppsRiseMicros)/1000;
-      updated = gps.date.age() < ppmAge && gps.time.age() < ppmAge;
+    }
+    if (gps.location.age() > ppsAgeMicros) {
+      // Location age before the PPS pulse implies we don't have a fix.
+      // try again in a little while.
+      if (debugIsOn) {
+        Serial.println("Got a time fix but no location. GPS location mode A/D would indicate a fix, we got: " + String(gps.location.FixMode()));
+      }
+      continue;
     }
     unsigned long thisPpsRise = ppsRiseMicros;
 
@@ -199,6 +207,9 @@ void setDateAndTimeFromGPS(void *parameter) {
         unsigned long microsBetweenAdjustments = microsSinceLastAdjustment(microsAfterRTC);
         time_t deltaMicros = (updateDelta * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
         double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
+        if (microsBetweenAdjustments > maxAdjustmentGapMicros) {
+          maxAdjustmentGapMicros = microsBetweenAdjustments;
+        }
 
         // how close was the previous drift adjustment?
         lastErrorMicros = deltaMicros - microsBetweenAdjustments*lastDrift;
@@ -483,7 +494,7 @@ void displayInfo(void *param) {
   // Thursday, May 30 2024
   // <big> 09:50:26 UTC </big>
   // Drift: 123us, max: 1234us
-  // Sats: 12, Last fix: 1234.56s
+  // Sats: 6/6/12, Fix: 1234s
   // uptime: 123 days 12:34:56
 
   while (true) {
@@ -498,7 +509,7 @@ void displayInfo(void *param) {
     u8g2.setFont(u8g2_font_originalsans_tr);
     float maxDriftMicros = (static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6;
     u8g2.drawStr(0, 3*lineHeight-2,("Drift: " + String(int(ceil(lastErrorMicros))) + "us, max: " + String(int(ceil(maxDriftMicros))) + "us").c_str());
-    u8g2.drawStr(0, 4*lineHeight-2, ("Sats: " + String(gps.satellites.value()) + ", Last fix: " + String(gps.time.age()/1000.0) + "s").c_str());
+    u8g2.drawStr(0, 4*lineHeight-2, ("Sats: " + String(gps.satellites.value()) + "/" + String(gps.satellitesStats.nrSatsTracked()) + "/" + String(gps.satellitesStats.nrSatsVisible()) + ", Fix: " + String(gps.location.age()/1000) + "s").c_str());
     u8g2.drawStr(0, 5*lineHeight-2, ("Uptime: " + getUptime()).c_str());
     u8g2.sendBuffer();
 
@@ -517,15 +528,15 @@ bool readGPS() {
     if (nmeaCurrSentence.indexOf("GLL") >= 0) {
       // GLL seems to be the last of a set of sentences.
       // find any previous GLL sentence and remove it and anything before.
-      std::vector<String>::iterator it = lastSentences.begin(), end = lastSentences.end();
+      std::vector<String>::iterator it = lastNmeaSentences.begin(), end = lastNmeaSentences.end();
       for (; it != end; ++it) {
         if ((*it).indexOf("GLL") > 0) {
-          lastSentences.erase(lastSentences.begin(), it+1);
+          lastNmeaSentences.erase(lastNmeaSentences.begin(), it+1);
           break;
         }
       }
     }
-    lastSentences.push_back(nmeaCurrSentence);
+    lastNmeaSentences.push_back(nmeaCurrSentence);
     nmeaCurrSentence = "";
     return true;
   }
@@ -542,16 +553,18 @@ void handleWebRequest() {
     server.sendContent("drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>");
     server.sendContent("Uptime: " + String(getUptime()) + "</br>");
     server.sendContent("Fix satellites: " + String(gps.satellites.value()) + "</br>");
+    server.sendContent("Last fix: " + String(gps.location.age()/1000.0) + "s ago. Max time between adjustments: " + String(maxAdjustmentGapMicros/1000000) + "s");
   } else {
     server.send(200, "text/html", "Acquiring gps...</br>");
   }
 
   server.sendContent("Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
   server.sendContent("</br></br>Last NMEA sentences:</br></br>");
-  std::vector<String>::iterator it = lastSentences.begin(), end = lastSentences.end();
+  std::vector<String>::iterator it = lastNmeaSentences.begin(), end = lastNmeaSentences.end();
   for (; it != end; ++it) {
     server.sendContent(*it + "</br>");
   }
+  server.sendContent("</br></br><a href='/update'>Firmware update</a>");
   
   // This tells the client to disconnect
   server.sendContent("");
@@ -648,7 +661,7 @@ void setup() {
     while (GPSDevice.available()) {
       if(readGPS()) {
         // output the sentence that just finished
-        Serial.print(lastSentences.back());
+        Serial.print(lastNmeaSentences.back());
       }
       if(gps.satellitesStats.isUpdated()) {
         u8g2.clearBuffer();
