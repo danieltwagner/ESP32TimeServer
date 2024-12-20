@@ -178,7 +178,7 @@ void setDateAndTimeFromGPS(void *parameter) {
 
     // At this point we have the pps rise time in micros as well as the corresponding GPS time.
     // We also know our RTC time and when we took it, in micros.
-    time_t updateDelta = gpsDateAndTime - rtc_now.tv_sec;
+    time_t updateDeltaSecs = gpsDateAndTime - rtc_now.tv_sec;
 
     // avoid changing date/time while an NTP request is being answered
     if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
@@ -205,7 +205,9 @@ void setDateAndTimeFromGPS(void *parameter) {
         // calculate drift
         unsigned long microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
         unsigned long microsBetweenAdjustments = microsSinceLastAdjustment(microsAfterRTC);
-        time_t deltaMicros = (updateDelta * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
+
+        // adjustment in microseconds, accounting for time taken to measure the RTC time
+        time_t deltaMicros = (updateDeltaSecs * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
         double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
         if (microsBetweenAdjustments > maxAdjustmentGapMicros) {
           maxAdjustmentGapMicros = microsBetweenAdjustments;
@@ -225,7 +227,7 @@ void setDateAndTimeFromGPS(void *parameter) {
         }
         
         if (debugIsOn) {
-          Serial.println("Adjusted the clock by adding " + String(updateDelta) + "s (" + String(deltaMicros) + "us)");
+          Serial.println("Adjusted the clock by adding " + String(updateDeltaSecs) + "s (" + String(deltaMicros) + "us)");
           Serial.print(microsBetweenAdjustments);
           Serial.print("us passed between adjustments. Clock drift is ");
           Serial.print(clockDrift * 1000000.0);
@@ -548,17 +550,39 @@ void handleWebRequest() {
   // constructing the string or computing the length first.
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
 
+  server.send(200, "text/html", "Uptime: " + String(getUptime()) + "</br></br>");
+
   if(didSetGPSTime) {
-    server.send(200, "text/html", "Time: " + rtc.getDateTime(true) + " UTC<br/>");
-    server.sendContent("drift: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>");
-    server.sendContent("Uptime: " + String(getUptime()) + "</br>");
-    server.sendContent("Fix satellites: " + String(gps.satellites.value()) + "</br>");
-    server.sendContent("Last fix: " + String(gps.location.age()/1000.0) + "s ago. Max time between adjustments: " + String(maxAdjustmentGapMicros/1000000) + "s");
+    server.sendContent("Status: Serving NTP.</br></br>");
+    server.sendContent("Clock drift after applying adjustment: " + String(lastDrift * 1000000.0) + "ppm.</br>");
+    server.sendContent("Last cumulative clock drift when adjusting: " + String(lastErrorMicros) + "us, max observed drift (root dispersion): " + String((static_cast<float>(maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>");
+    server.sendContent("Time since last adjustment: " + String(microsSinceLastAdjustment(micros())/1000000) + "s</br>");
+    server.sendContent("Max time between adjustments: " + String(maxAdjustmentGapMicros/1000000) + "s</br></br>");
   } else {
-    server.send(200, "text/html", "Acquiring gps...</br>");
+    server.sendContent("Status: Waiting for GPS fix...</br></br>");
   }
 
-  server.sendContent("Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
+  server.sendContent("Time: " + rtc.getDateTime(true) + " UTC<br/>");
+  
+  if (gps.location.age() < ULONG_MAX) {
+    server.sendContent("Fix satellites: " + String(gps.satellites.value()) + "</br>");
+    server.sendContent("Last fix: " + String(gps.location.age()/1000.0) + "s ago.</br>");
+  }
+
+  server.sendContent("</br>Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
+  for (int i = 0; i < gps.satellitesStats.nrSatsTracked(); i++) {
+    String satType = " (unknown type)";
+    if (1 <= gps.satellitesStats.id[i] <= 32) {
+      satType = " (GPS)";
+    } else if (33 <= gps.satellitesStats.id[i] <= 64) {
+      satType = " (SBAS)";
+    } else if (65 <= gps.satellitesStats.id[i] <= 96) {
+      satType = " (GLONASS)";
+    } else if (193 <= gps.satellitesStats.id[i] <= 197) {
+      satType = " (QZSS)";
+    }
+    server.sendContent("</br>&nbsp;&nbsp;Satellite " + String(gps.satellitesStats.id[i]) + satType + " SNR: " + String(gps.satellitesStats.snr[i]));
+  }
   server.sendContent("</br></br>Last NMEA sentences:</br></br>");
   std::vector<String>::iterator it = lastNmeaSentences.begin(), end = lastNmeaSentences.end();
   for (; it != end; ++it) {
@@ -575,7 +599,7 @@ void setup() {
   Serial.println("ESP32 Time Server starting");
 
   u8g2.begin();
-  displayCentered("ESP32 Time Server");  
+  displayCentered("ESP32 Time Server");
   
   // wifi and bluetooth aren't needed so turn them off
   Serial.println("Disabling wifi and bluetooth");
@@ -602,6 +626,7 @@ void setup() {
   Serial.println(String(clockReadTime) + "us, precision = " + String(precision));
 
   Serial.println("Setting up networking");
+  displayCentered("Waiting for DHCP...");
   setupEthernet();
 
   // Web server and OTA
