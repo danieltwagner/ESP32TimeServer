@@ -14,9 +14,18 @@ enum class TimeServerState {
     SERVING_NTP,
 };
 
+// What is the periodic task doing?
+enum class StateDetail {
+    IDLE,
+    AWAIT_PPS,
+    AWAIT_FIX,
+    SETTING_TIME,
+};
+
 class TimeServer {
 public:
     volatile TimeServerState state = TimeServerState::WAITING_FOR_DHCP;
+    volatile StateDetail stateDetail = StateDetail::IDLE;
     volatile int64_t ppsRiseMicros; // The micros() of the last PPS rising edge
     volatile int8_t precision;
 

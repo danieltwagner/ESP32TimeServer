@@ -5,24 +5,58 @@
 #include "web.h"
 #include "state.h"
 
+String statusString(TimeServerState state) {
+  if (state == TimeServerState::WAITING_FOR_INITIAL_FIX) {
+    return "Waiting for initial GPS fix";
+  } else if (state == TimeServerState::MEASURING_DRIFT_INITIAL) {
+    return "Measuring clock drift (initial)";
+  } else if (state == TimeServerState::MEASURING_DRIFT_VARIATION) {
+    return "Characterizing clock drift (variation)";
+  } else if (state == TimeServerState::SERVING_NTP) {
+    return "Serving NTP";
+  }
+}
+
+String detailedStatusString(StateDetail stateDetail) {
+  if (stateDetail == StateDetail::IDLE) {
+    return "Idle";
+  } else if (stateDetail == StateDetail::AWAIT_PPS) {
+    return "Awaiting PPS";
+  } else if (stateDetail == StateDetail::AWAIT_FIX) {
+    return "Awaiting GPS fix";
+  } else if (stateDetail == StateDetail::SETTING_TIME) {
+    return "Setting time";
+  }
+
+  return "Unknown";
+}
+
+String satelliteTypeString(TinyGPSSystem system, uint8_t satId) {
+    if (system == TinyGPSSystem::GPS) {
+      if (satId >= 193) {
+        return " (QZSS)";
+      } else if (satId >= 33) {
+        return " (SBAS)";
+      } else {
+        return " (GPS)";
+      }
+    } else if (system == TinyGPSSystem::GLONASS) {
+      return " (GLONASS)";
+    } else if (system == TinyGPSSystem::GALILEO) {
+      return " (GALILEO)";
+    } else if (system == TinyGPSSystem::BEIDOU) {
+      return " (BEIDOU)";
+    }
+    return (" (Unknown)");
+}
+
 void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGPSPlus &gps, std::vector<String> &lastNmeaSentences) {
   // This allows us to keep outputting NMEA sentences without 
   // constructing the string or computing the length first.
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
 
   server.send(200, "text/html", "Uptime: " + String(getUptime()) + "</br></br>");
-
-  server.sendContent("Status: ");
-  if (timeServer.state == TimeServerState::WAITING_FOR_INITIAL_FIX) {
-    server.sendContent("Waiting for initial GPS fix");
-  } else if (timeServer.state == TimeServerState::MEASURING_DRIFT_INITIAL) {
-    server.sendContent("Measuring clock drift (initial)");
-  } else if (timeServer.state == TimeServerState::MEASURING_DRIFT_VARIATION) {
-    server.sendContent("Characterizing clock drift (variation)");
-  } else if (timeServer.state == TimeServerState::SERVING_NTP) {
-    server.sendContent("Serving NTP");
-  }
-  server.sendContent("</br></br>");
+  server.sendContent("Status: " + statusString(timeServer.state) + " (Adjustment task: " + detailedStatusString(timeServer.stateDetail) + ")" + "</br></br>");
 
   if(timeServer.state != TimeServerState::WAITING_FOR_INITIAL_FIX) {
     String rtcSource = "Internal 150kHz RC oscillator";
@@ -51,22 +85,6 @@ void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGP
   server.sendContent("</br>Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));
   for (TinyGPSSystem system : {TinyGPSSystem::GPS, TinyGPSSystem::GLONASS, TinyGPSSystem::GALILEO, TinyGPSSystem::BEIDOU}) {  
     int systemOffset = static_cast<uint8_t>(system) * _GPS_MAX_NR_ACTIVE_SATELLITES;
-    String satType;
-    switch (system)
-    {
-    case TinyGPSSystem::GPS:
-      satType = " (GPS)";
-      break;
-    case TinyGPSSystem::GLONASS:
-      satType = " (GLONASS)";
-      break;
-    case TinyGPSSystem::GALILEO:
-      satType = " (GALILEO)";
-      break;
-    case TinyGPSSystem::BEIDOU:
-      satType = " (BEIDOU)";
-      break;
-    }
 
     for (int i = 0; i < _GPS_MAX_NR_ACTIVE_SATELLITES; i++) {
       uint8_t snr = gps.satellitesStats.snr[i + systemOffset];
@@ -74,7 +92,7 @@ void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGP
         continue;
       }
       uint8_t satId = gps.satellitesStats.id[i + systemOffset];
-      server.sendContent("</br>&nbsp;&nbsp;Satellite " + String(satId) + satType + " SNR: " + String(snr));
+      server.sendContent("</br>&nbsp;&nbsp;Satellite " + String(satId) + satelliteTypeString(system, satId) + " SNR: " + String(snr));
     }
   }
   server.sendContent("</br></br>Last NMEA sentences:</br></br>");

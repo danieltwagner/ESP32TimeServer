@@ -27,12 +27,16 @@ int64_t TimeServer::getDriftAdjustmentMicros() {
 void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
   while (true) {
 
+    stateDetail = StateDetail::AWAIT_PPS;
+
     int64_t lastPpsRise = ppsRiseMicros;
     // wait for a new pps rising flag. This makes life a little easier later because we
     // know we're at the start of a second rather than *just* before a new pulse arrives
     while (ppsRiseMicros == lastPpsRise) {
       delay(10);
     }
+
+    stateDetail = StateDetail::AWAIT_FIX;
 
     // Now wait until both date and time are more recent than the corresponding pulse.
     // Note that date is only updated as part of the RMC sentence, along with time and
@@ -63,6 +67,8 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     struct timeval rtc_now;
     gettimeofday(&rtc_now, NULL);
     int64_t microsAfterRTC = esp_timer_get_time();
+
+    stateDetail = StateDetail::SETTING_TIME;
 
     // At this point we have the pps rise time in micros as well as the corresponding GPS time.
     // We also know our RTC time and when we took it, in micros.
@@ -144,6 +150,8 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       }
 
       lastAdjustmentMicros = microsAfterRTC;
+
+      stateDetail = StateDetail::IDLE;
       vTaskDelay(60000 / portTICK_PERIOD_MS);
     }
   }
