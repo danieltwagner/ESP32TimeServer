@@ -158,8 +158,14 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       }
 
       lastAdjustmentMicros = microsAfterRTC;
-
       stateDetail = StateDetail::IDLE;
+
+      if (state == TimeServerState::MEASURING_DRIFT_INITIAL) {
+        // sleep for an extra minute
+        // TODO: Alternatively, keep checking until we can predict drift reasonably well
+        vTaskDelay(60000 / portTICK_PERIOD_MS);
+      }
+
       vTaskDelay(adjustmentTaskSleepSec * 1000 / portTICK_PERIOD_MS);
     }
   }
