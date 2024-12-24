@@ -4,6 +4,8 @@
 
 #include "state.h"
 
+const int adjustmentTaskSleepSec = 10;
+
 int64_t TimeServer::microsSinceLastAdjustment(int64_t microsNow)
 {
     // corner case: deal with micros wrapping
@@ -152,7 +154,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       lastAdjustmentMicros = microsAfterRTC;
 
       stateDetail = StateDetail::IDLE;
-      vTaskDelay(60000 / portTICK_PERIOD_MS);
+      vTaskDelay(adjustmentTaskSleepSec * 1000 / portTICK_PERIOD_MS);
     }
   }
 }
