@@ -115,7 +115,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         // adjustment in microseconds, accounting for time taken to measure the RTC time
         time_t deltaMicros = (updateDeltaSecs * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
         double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
-        if (microsBetweenAdjustments > maxAdjustmentGapMicros) {
+        if (microsBetweenAdjustments > maxAdjustmentGapMicros && state == TimeServerState::SERVING_NTP) {
           maxAdjustmentGapMicros = microsBetweenAdjustments;
         }
 
