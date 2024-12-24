@@ -37,15 +37,17 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     while (ppsRiseMicros == lastPpsRise) {
       delay(10);
     }
+    int64_t thisPpsRise = ppsRiseMicros;
 
     stateDetail = StateDetail::AWAIT_FIX;
 
     // Now wait until both date and time are more recent than the corresponding pulse.
     // Note that date is only updated as part of the RMC sentence, along with time and
     // location (location only if we have a valid fix), so we can just check for date.
-    uint32_t ppsAgeMillis = (esp_timer_get_time() - ppsRiseMicros)/1000;
+    uint32_t ppsAgeMillis = (esp_timer_get_time() - thisPpsRise)/1000;
     while (gps->date.age() > ppsAgeMillis) {
       delay(10);
+      ppsAgeMillis = (esp_timer_get_time() - thisPpsRise)/1000;
     }
     if (gps->location.age() > ppsAgeMillis) {
       // Location age before the PPS pulse implies we don't have a fix.
@@ -55,7 +57,11 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       }
       continue;
     }
-    int64_t thisPpsRise = ppsRiseMicros;
+
+    if (thisPpsRise != ppsRiseMicros) {
+      // we've had a new PPS pulse since we started waiting for a fix
+      continue;
+    }
 
     struct tm wt;
     wt.tm_year = gps->date.year() - 1900; // 1900 is year 0
