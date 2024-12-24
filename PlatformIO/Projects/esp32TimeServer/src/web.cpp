@@ -16,13 +16,15 @@ void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGP
   if (timeServer.state == TimeServerState::WAITING_FOR_INITIAL_FIX) {
     server.sendContent("Waiting for initial GPS fix");
   } else if (timeServer.state == TimeServerState::MEASURING_DRIFT_INITIAL) {
-    server.sendContent("Characterizing clock drift");
+    server.sendContent("Measuring clock drift (initial)");
+  } else if (timeServer.state == TimeServerState::MEASURING_DRIFT_VARIATION) {
+    server.sendContent("Characterizing clock drift (variation)");
   } else if (timeServer.state == TimeServerState::SERVING_NTP) {
     server.sendContent("Serving NTP");
   }
   server.sendContent("</br></br>");
 
-  if(timeServer.state == TimeServerState::SERVING_NTP) {
+  if(timeServer.state != TimeServerState::WAITING_FOR_INITIAL_FIX) {
     String rtcSource = "Internal 150kHz RC oscillator";
     switch(rtc_clk_slow_freq_get()) {
       case RTC_SLOW_FREQ_8MD256:
