@@ -8,13 +8,13 @@
 String statusString(TimeServerState state) {
   if (state == TimeServerState::WAITING_FOR_INITIAL_FIX) {
     return "Waiting for initial GPS fix";
-  } else if (state == TimeServerState::MEASURING_DRIFT_INITIAL) {
-    return "Measuring clock drift (initial)";
-  } else if (state == TimeServerState::MEASURING_DRIFT_VARIATION) {
-    return "Characterizing clock drift (variation)";
+  } else if (state == TimeServerState::MEASURING_DRIFT) {
+    return "Measuring clock drift";
   } else if (state == TimeServerState::SERVING_NTP) {
     return "Serving NTP";
   }
+
+  return "Unknown";
 }
 
 String detailedStatusString(StateDetail stateDetail) {
@@ -69,17 +69,17 @@ void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGP
         break;
     }
     server.sendContent("RTC clock source: " + rtcSource + "</br>");
-    server.sendContent("Clock drift: " + String(timeServer.lastDrift * 1000000.0) + "ppm, after applying adjustments: " + String((timeServer.lastDrift - timeServer.previousDrift) * 1000000.0) + "ppm.</br>");
+    server.sendContent("Clock drift was last " + String(timeServer.lastClockDrift * 1e6) + "ppm, regression suggests: " + String(timeServer.driftEstimate * 1e6) + "ppm.</br>");
     server.sendContent("Last cumulative clock drift when adjusting: " + String(timeServer.lastErrorMicros) + "us, max observed drift (root dispersion, fixed point, min is 15.26us): " + String((static_cast<float>(timeServer.maxObservedDrift) / (1 << 16)) * 1e6) + "us<br/>");
-    server.sendContent("Time since last adjustment: " + String(timeServer.microsSinceLastAdjustment(esp_timer_get_time())/1000000) + "s</br>");
-    server.sendContent("Max time between adjustments: " + String(timeServer.maxAdjustmentGapMicros/1000000) + "s</br></br>");
+    server.sendContent("Time since last adjustment: " + String((esp_timer_get_time() - timeServer.lastAdjustmentMicros)/1e6) + "s</br>");
+    server.sendContent("Max time between adjustments: " + String(timeServer.maxAdjustmentGapMicros/1e6) + "s</br></br>");
   }
 
   server.sendContent("Time: " + rtc.getDateTime(true) + " UTC<br/>");
   
   if (gps.location.age() < ULONG_MAX) {
     server.sendContent("Fix satellites: " + String(gps.satellites.value()) + "</br>");
-    server.sendContent("Last fix: " + String(gps.location.age()/1000.0) + "s ago, last PPS pulse: " + String((esp_timer_get_time() - timeServer.ppsRiseMicros)/1000000.0) + "s ago.</br>");
+    server.sendContent("Last fix: " + String(gps.location.age()/1000.0) + "s ago, last PPS pulse: " + String((esp_timer_get_time() - timeServer.ppsRiseMicros)/1e6) + "s ago.</br>");
   }
 
   server.sendContent("</br>Satellites visible: " + String(gps.satellitesStats.nrSatsVisible()) + " Satellites tracked: " + String(gps.satellitesStats.nrSatsTracked()));

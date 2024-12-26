@@ -1,4 +1,4 @@
-// Rob Latour, 2023
+// Rob Latour, 2023 with modifications by Daniel Wagner
 // License: MIT
 // https://github.com/roblatour
 //
@@ -57,8 +57,11 @@ void setup() {
   Serial.println("ESP32 Time Server starting");
 
   // Regular internal 150 kHz RC oscillator results in around 9ppm drift, and is constant to about 0.3ppm minute-to-minute.
+  // Supposedly the 8MHz RC oscillator is more accurate.
   // See also https://esp32.com/viewtopic.php?t=31371 and https://github.com/espressif/arduino-esp32/issues/7669
-  //rtc_clk_slow_freq_set(RTC_SLOW_FREQ_8MD256);
+  // Ah, it turns out the RTC slow clock is not used for the main clock, it just drives "RTC domain" analog functions.
+  // See https://esp32.com/viewtopic.php?t=2742
+  // rtc_clk_slow_freq_set(RTC_SLOW_FREQ_8MD256);
 
   timeServer.state = TimeServerState::INITIALIZING;
 

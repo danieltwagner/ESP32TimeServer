@@ -5,12 +5,13 @@
 #include <ESP32Time.h>
 #include <TinyGPSPlus.h>
 
+#include "clockdrift.h"
+
 enum class TimeServerState {
     INITIALIZING,
     WAITING_FOR_DHCP,
     WAITING_FOR_INITIAL_FIX,
-    MEASURING_DRIFT_INITIAL, // we have a fix but no idea about drift yet
-    MEASURING_DRIFT_VARIATION, // we have measured initial drift, let's see how stable it is
+    MEASURING_DRIFT, // we have a fix but haven't characterized drift yet
     SERVING_NTP,
 };
 
@@ -23,6 +24,9 @@ enum class StateDetail {
 };
 
 class TimeServer {
+private:
+    DriftCalculator driftCalc;
+
 public:
     volatile TimeServerState state = TimeServerState::WAITING_FOR_DHCP;
     volatile StateDetail stateDetail = StateDetail::IDLE;
@@ -33,16 +37,15 @@ public:
     volatile int64_t lastAdjustmentMicros = 0;
     volatile int64_t lastErrorMicros;
     // Last clock drift we observed when syncing against GPS
-    volatile double lastDrift = 0;
-    // the previous value of lastDrift, only used for debugging
-    volatile double previousDrift = 0;
+    volatile double lastClockDrift = 0;
+    volatile double driftEstimate = 0;
     volatile uint32_t maxObservedDrift = 0; // pre-computed field used as part of the NTP message
 
-    SemaphoreHandle_t mutex = xSemaphoreCreateMutex();         // used to ensure an NTP request results are not impacted by the process that refreshes the time
+    // used to ensure an NTP request results and time updates are mutually exclusive
+    SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
 
     bool debugIsOn = true;
-  
-    int64_t microsSinceLastAdjustment(int64_t microsNow);
+
     int64_t getDriftAdjustmentMicros();
     void setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps);
 };

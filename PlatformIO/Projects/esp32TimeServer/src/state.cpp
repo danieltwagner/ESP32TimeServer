@@ -6,24 +6,10 @@
 
 const int adjustmentTaskSleepSec = 10;
 
-int64_t TimeServer::microsSinceLastAdjustment(int64_t microsNow)
-{
-    // corner case: deal with micros wrapping
-    if (microsNow < lastAdjustmentMicros)
-    {
-        return microsNow + (ULONG_MAX - lastAdjustmentMicros);
-    }
-    return microsNow - lastAdjustmentMicros;
-}
-
 int64_t TimeServer::getDriftAdjustmentMicros() {
-  // exit if we don't have an adjustment or computed drift
-  if (lastAdjustmentMicros == 0 || lastDrift == 0) {
-    return 0;
-  }
+  if (driftEstimate == 0) return 0;
 
-  int64_t deltaMicros = microsSinceLastAdjustment(esp_timer_get_time());
-  return -lastDrift * (double)deltaMicros;
+  return -driftEstimate * (esp_timer_get_time() - lastAdjustmentMicros);
 }
 
 void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
@@ -62,6 +48,8 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       // we've had a new PPS pulse since we started waiting for a fix
       continue;
     }
+
+    // GPS time now matches the PPS pulse
 
     struct tm wt;
     wt.tm_year = gps->date.year() - 1900; // 1900 is year 0
@@ -104,67 +92,58 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       }
 
       if (
-        state == TimeServerState::MEASURING_DRIFT_INITIAL || 
-        state == TimeServerState::MEASURING_DRIFT_VARIATION ||
+        state == TimeServerState::MEASURING_DRIFT ||
         state == TimeServerState::SERVING_NTP
       ) {
         // calculate drift
         int64_t microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
-        int64_t microsBetweenAdjustments = microsSinceLastAdjustment(microsAfterRTC);
-
-        // adjustment in microseconds, accounting for time taken to measure the RTC time
-        time_t deltaMicros = (updateDeltaSecs * 1000000) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
-        double clockDrift = (double)deltaMicros / (double)microsBetweenAdjustments;
+        int64_t microsBetweenAdjustments = microsAfterRTC - lastAdjustmentMicros;
         if (microsBetweenAdjustments > maxAdjustmentGapMicros && state == TimeServerState::SERVING_NTP) {
           maxAdjustmentGapMicros = microsBetweenAdjustments;
         }
 
+        // clock error in microseconds, accounting for time taken to measure the RTC time
+        time_t errorMicros = (updateDeltaSecs * 1e6) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
+        lastClockDrift = (double)errorMicros / (double)microsBetweenAdjustments;
+
         // how close was the previous drift adjustment?
-        lastErrorMicros = deltaMicros - microsBetweenAdjustments*lastDrift;
-        
+        lastErrorMicros = errorMicros - microsBetweenAdjustments * driftEstimate;
+
         // Pre-compute fixed-point format for use in the NTP message
-        if (state == TimeServerState::MEASURING_DRIFT_VARIATION || state == TimeServerState::SERVING_NTP) {
+        if (state == TimeServerState::SERVING_NTP || driftCalc.hasMaxSamples()) {
 
           // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
           uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
           if (fixedPointValue > maxObservedDrift) {
             maxObservedDrift = fixedPointValue;
           }
-
-          // we're ready to serve NTP now
-          state = TimeServerState::SERVING_NTP;
-        } else {
-          // we now have an initial drift measurement. See how it changes over time before we start serving.
-          state = TimeServerState::MEASURING_DRIFT_VARIATION;
         }
+
+        // Update our drift measurement. As we only have microsecond resolution timers,
+        // we want to do some kind of regression as a single microsecond is 0.1ppm drift
+        // if we measure every 10s. The alternative would be to wait longer between
+        // measurements but then we'd accumulate more error before we could correct it.
+        driftCalc.addSample(microsBetweenAdjustments, errorMicros);
+        driftEstimate = driftCalc.getDrift();
         
         if (debugIsOn) {
-          Serial.println("Adjusted the clock by adding " + String(updateDeltaSecs) + "s (" + String(deltaMicros) + "us)");
+          Serial.println("Adjusted the clock by adding " + String(updateDeltaSecs) + "s (" + String(errorMicros) + "us)");
           Serial.print(microsBetweenAdjustments);
           Serial.print("us passed between adjustments. Clock drift is ");
-          Serial.print(clockDrift * 1000000.0);
-          Serial.print("ppm. Last run was ");
-          Serial.print(lastDrift * 1000000.0);
+          Serial.print(lastClockDrift * 1e6);
+          Serial.print("ppm. Drift regression suggests " + String(driftEstimate * 1e6) + "ppm.");
           Serial.println("ppm.");
 
           Serial.println("When adjusting for drift we had a cumulative error of " + String(lastErrorMicros) + "us.");
         }
 
-        previousDrift = lastDrift;
-        lastDrift = clockDrift;
       } else {
         // we did get a fix, now we want to characterize drift
-        state = TimeServerState::MEASURING_DRIFT_INITIAL;
+        state = TimeServerState::MEASURING_DRIFT;
       }
 
       lastAdjustmentMicros = microsAfterRTC;
       stateDetail = StateDetail::IDLE;
-
-      if (state == TimeServerState::MEASURING_DRIFT_INITIAL) {
-        // sleep for an extra minute
-        // TODO: Alternatively, keep checking until we can predict drift reasonably well
-        vTaskDelay(60000 / portTICK_PERIOD_MS);
-      }
 
       vTaskDelay(adjustmentTaskSleepSec * 1000 / portTICK_PERIOD_MS);
     }
