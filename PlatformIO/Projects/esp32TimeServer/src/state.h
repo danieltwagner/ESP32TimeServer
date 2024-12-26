@@ -35,11 +35,15 @@ public:
 
     volatile int64_t maxAdjustmentGapMicros = 0;
     volatile int64_t lastAdjustmentMicros = 0;
-    volatile int64_t lastErrorMicros;
+    volatile int64_t lastErrorMicros = 0;
+    volatile int64_t maxObservedErrorMicros = 0;
+    // pre-computed fixed-point value used as part of the NTP message
+    volatile uint32_t rootDispersion = 0;
+
     // Last clock drift we observed when syncing against GPS
     volatile double lastClockDrift = 0;
+    // Drift estimate aggregated across multiple samples
     volatile double driftEstimate = 0;
-    volatile uint32_t maxObservedDrift = 0; // pre-computed field used as part of the NTP message
 
     // used to ensure an NTP request results and time updates are mutually exclusive
     SemaphoreHandle_t mutex = xSemaphoreCreateMutex();

@@ -98,7 +98,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         // calculate drift
         int64_t microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
         int64_t microsBetweenAdjustments = microsAfterRTC - lastAdjustmentMicros;
-        if (microsBetweenAdjustments > maxAdjustmentGapMicros && state == TimeServerState::SERVING_NTP) {
+        if ((microsBetweenAdjustments > maxAdjustmentGapMicros) && (state == TimeServerState::SERVING_NTP)) {
           maxAdjustmentGapMicros = microsBetweenAdjustments;
         }
 
@@ -112,10 +112,14 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         // Pre-compute fixed-point format for use in the NTP message
         if (state == TimeServerState::SERVING_NTP || driftCalc.hasMaxSamples()) {
 
+          if (abs(lastErrorMicros) > maxObservedErrorMicros) {
+            maxObservedErrorMicros = abs(lastErrorMicros);
+          }
+
           // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
           uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
-          if (fixedPointValue > maxObservedDrift) {
-            maxObservedDrift = fixedPointValue;
+          if (fixedPointValue > rootDispersion) {
+            rootDispersion = fixedPointValue;
           }
         }
 

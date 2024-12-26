@@ -46,7 +46,7 @@ void displayInfo(TimeServer &timeServer, ESP32Time &rtc, TinyGPSPlus &gps) {
     u8g2.drawStr(0, lineHeight+1, (rtc.getTime() + " UTC").c_str());
 
     u8g2.setFont(u8g2_font_originalsans_tr);
-    float maxDriftMicros = (static_cast<float>(timeServer.maxObservedDrift) / (1 << 16)) * 1e6;
+    float maxDriftMicros = (static_cast<float>(timeServer.rootDispersion) / (1 << 16)) * 1e6;
     u8g2.drawStr(0, 3*lineHeight-2,("Drift: " + String(int(ceil(timeServer.lastErrorMicros))) + "us, max: " + String(int(ceil(maxDriftMicros))) + "us").c_str());
     u8g2.drawStr(0, 4*lineHeight-2, ("Sats: " + String(gps.satellites.value()) + "/" + String(gps.satellitesStats.nrSatsTracked()) + "/" + String(gps.satellitesStats.nrSatsVisible()) + ", Fix: " + String(gps.location.age()/1000) + "s").c_str());
     u8g2.drawStr(0, 5*lineHeight-2, ("Uptime: " + getUptime()).c_str());

@@ -61,10 +61,10 @@ void sendNTPpacket(IPAddress remoteIP, int remotePort, TimeServer timeServer) {
   // The value is a 32-bit signed fixed-point number in units of seconds,
   // with the fraction point between bits 15 and 16.
   // We use the maximum error observed once drift adjustment happens.
-  packetBuffer[8] = (int)((timeServer.maxObservedDrift >> 24) & 0xFF);
-  packetBuffer[9] = (int)((timeServer.maxObservedDrift >> 16) & 0xFF);
-  packetBuffer[10] = (int)((timeServer.maxObservedDrift >> 8) & 0xFF);
-  packetBuffer[11] = (int)(timeServer.maxObservedDrift & 0xFF);
+  packetBuffer[8] = (int)((timeServer.rootDispersion >> 24) & 0xFF);
+  packetBuffer[9] = (int)((timeServer.rootDispersion >> 16) & 0xFF);
+  packetBuffer[10] = (int)((timeServer.rootDispersion >> 8) & 0xFF);
+  packetBuffer[11] = (int)(timeServer.rootDispersion & 0xFF);
 
   // time source (namestring)
   packetBuffer[12] = 71; // G
