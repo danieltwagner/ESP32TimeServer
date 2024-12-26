@@ -34,7 +34,7 @@ public:
     volatile int8_t precision;
 
     volatile int64_t maxAdjustmentGapMicros = 0;
-    volatile int64_t lastAdjustmentMicros = 0;
+    volatile int64_t lastAdjustmentPpsRiseMicros = 0;
     volatile int64_t lastErrorMicros = 0;
     volatile int64_t maxObservedErrorMicros = 0;
     // pre-computed fixed-point value used as part of the NTP message

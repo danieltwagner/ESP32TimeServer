@@ -9,7 +9,7 @@ const int adjustmentTaskSleepSec = 10;
 int64_t TimeServer::getDriftAdjustmentMicros() {
   if (driftEstimate == 0) return 0;
 
-  return -driftEstimate * (esp_timer_get_time() - lastAdjustmentMicros);
+  return -driftEstimate * (esp_timer_get_time() - lastAdjustmentPpsRiseMicros);
 }
 
 void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
@@ -23,17 +23,17 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     while (ppsRiseMicros == lastPpsRise) {
       delay(10);
     }
-    int64_t thisPpsRise = ppsRiseMicros;
+    int64_t thisPpsRiseMicros = ppsRiseMicros;
 
     stateDetail = StateDetail::AWAIT_FIX;
 
     // Now wait until both date and time are more recent than the corresponding pulse.
     // Note that date is only updated as part of the RMC sentence, along with time and
     // location (location only if we have a valid fix), so we can just check for date.
-    uint32_t ppsAgeMillis = (esp_timer_get_time() - thisPpsRise)/1000;
+    uint32_t ppsAgeMillis = (esp_timer_get_time() - thisPpsRiseMicros)/1000;
     while (gps->date.age() > ppsAgeMillis) {
       delay(10);
-      ppsAgeMillis = (esp_timer_get_time() - thisPpsRise)/1000;
+      ppsAgeMillis = (esp_timer_get_time() - thisPpsRiseMicros)/1000;
     }
     if (gps->location.age() > ppsAgeMillis) {
       // Location age before the PPS pulse implies we don't have a fix.
@@ -44,12 +44,20 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       continue;
     }
 
-    if (thisPpsRise != ppsRiseMicros) {
+    if (thisPpsRiseMicros != ppsRiseMicros) {
       // we've had a new PPS pulse since we started waiting for a fix
       continue;
     }
 
-    // GPS time now matches the PPS pulse
+    // GPS time now matches the PPS pulse. What is the local time?
+    struct timeval rtc_now;
+    gettimeofday(&rtc_now, NULL);
+
+    // We may have spent some number of millis waiting for gps data to be read.
+    // microsAfterRTC will allow us to account for this.
+    int64_t microsAfterRTC = esp_timer_get_time();
+
+    stateDetail = StateDetail::SETTING_TIME;
 
     struct tm wt;
     wt.tm_year = gps->date.year() - 1900; // 1900 is year 0
@@ -60,12 +68,6 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     wt.tm_sec = gps->time.second();
     time_t gpsDateAndTime = mktime(&wt);
 
-    struct timeval rtc_now;
-    gettimeofday(&rtc_now, NULL);
-    int64_t microsAfterRTC = esp_timer_get_time();
-
-    stateDetail = StateDetail::SETTING_TIME;
-
     // At this point we have the pps rise time in micros as well as the corresponding GPS time.
     // We also know our RTC time and when we took it, in micros.
     time_t updateDeltaSecs = gpsDateAndTime - rtc_now.tv_sec;
@@ -74,12 +76,12 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
 
       // try again if a new PPS pulse has arrived since, as we'd be a second out from when we started
-      if (ppsRiseMicros != thisPpsRise) {
+      if (ppsRiseMicros != thisPpsRiseMicros) {
         continue;
       }
 
-      // set the real time clock, accounting for the extra micros that passed since we saw the PPS pulse
-      rtc->setTime(gpsDateAndTime, esp_timer_get_time() - thisPpsRise);
+      // set the real time clock, accounting for the extra time that passed since we saw the PPS pulse
+      rtc->setTime(gpsDateAndTime, (esp_timer_get_time() - thisPpsRiseMicros) / 1000);
 
       // release the hold
       xSemaphoreGive(mutex);
@@ -95,16 +97,15 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         state == TimeServerState::MEASURING_DRIFT ||
         state == TimeServerState::SERVING_NTP
       ) {
-        // calculate drift
-        int64_t microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRise;
-        int64_t microsBetweenAdjustments = microsAfterRTC - lastAdjustmentMicros;
+        int64_t microsBetweenAdjustments = thisPpsRiseMicros - lastAdjustmentPpsRiseMicros;
+        // we'll keep track of the max adjustment gap for debugging purposes
         if ((microsBetweenAdjustments > maxAdjustmentGapMicros) && (state == TimeServerState::SERVING_NTP)) {
           maxAdjustmentGapMicros = microsBetweenAdjustments;
         }
 
         // clock error in microseconds, accounting for time taken to measure the RTC time
+        int64_t microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRiseMicros;
         time_t errorMicros = (updateDeltaSecs * 1e6) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
-        lastClockDrift = (double)errorMicros / (double)microsBetweenAdjustments;
 
         // how close was the previous drift adjustment?
         lastErrorMicros = errorMicros - microsBetweenAdjustments * driftEstimate;
@@ -114,12 +115,9 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
 
           if (abs(lastErrorMicros) > maxObservedErrorMicros) {
             maxObservedErrorMicros = abs(lastErrorMicros);
-          }
 
-          // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
-          uint32_t fixedPointValue = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
-          if (fixedPointValue > rootDispersion) {
-            rootDispersion = fixedPointValue;
+            // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
+            rootDispersion = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
           }
         }
 
@@ -129,6 +127,9 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         // measurements but then we'd accumulate more error before we could correct it.
         driftCalc.addSample(microsBetweenAdjustments, errorMicros);
         driftEstimate = driftCalc.getDrift();
+
+        // we keep this for debugging purposes
+        lastClockDrift = (double)errorMicros / (double)microsBetweenAdjustments;
         
         if (debugIsOn) {
           Serial.println("Adjusted the clock by adding " + String(updateDeltaSecs) + "s (" + String(errorMicros) + "us)");
@@ -146,7 +147,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         state = TimeServerState::MEASURING_DRIFT;
       }
 
-      lastAdjustmentMicros = microsAfterRTC;
+      lastAdjustmentPpsRiseMicros = thisPpsRiseMicros;
       stateDetail = StateDetail::IDLE;
 
       vTaskDelay(adjustmentTaskSleepSec * 1000 / portTICK_PERIOD_MS);
