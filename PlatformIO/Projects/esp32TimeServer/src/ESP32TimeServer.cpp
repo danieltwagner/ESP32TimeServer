@@ -141,14 +141,14 @@ void setup() {
   // wait until the time is actually set
   Serial.println("Waiting for GPS time...");
 
-  while (timeServer.state == TimeServerState::WAITING_FOR_INITIAL_FIX) {
+  while (timeServer.state != TimeServerState::SERVING_NTP) {
     while (GPSDevice.available()) {
       if(readGPS() && timeServer.debugIsOn) {
         // output the sentence that just finished
         Serial.print(lastNmeaSentences.back());
       }
       if(gps.satellitesStats.isUpdated()) {
-        displayAcquiring(gps.satellitesStats);
+        displayAcquiring(timeServer.state, gps.satellitesStats);
       }
     }
     delay(10); // keep the watchdog happy

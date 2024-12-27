@@ -60,7 +60,7 @@ void renderWeb(WebServer &server, TimeServer &timeServer, ESP32Time &rtc, TinyGP
 
   if(timeServer.state != TimeServerState::WAITING_FOR_INITIAL_FIX) {
     server.sendContent("Clock drift was last " + String(timeServer.lastClockDrift * 1e6) + "ppm, regression suggests: " + String(timeServer.driftEstimate * 1e6) + "ppm.</br>");
-    server.sendContent("Last cumulative clock drift when adjusting: " + String(timeServer.lastErrorMicros) + "us, max observed error: " + String(timeServer.maxObservedErrorMicros) + "us -> root dispersion (fixed point, min is 15.26us): " + String((static_cast<float>(timeServer.rootDispersion) / (1 << 16)) * 1e6) + "us<br/>");
+    server.sendContent("Last cumulative clock drift when adjusting: " + String(timeServer.lastAdjustedErrorMicros) + "us, max observed error: " + String(timeServer.maxObservedErrorMicros) + "us -> root dispersion (fixed point, min is 15.26us): " + String((static_cast<float>(timeServer.rootDispersion) / (1 << 16)) * 1e6) + "us<br/>");
     server.sendContent("Time since last adjustment: " + String((esp_timer_get_time() - timeServer.lastAdjustmentPpsRiseMicros)/1e6) + "s</br>");
     server.sendContent("Max time between adjustments: " + String(timeServer.maxAdjustmentGapMicros/1e6) + "s</br></br>");
   }

@@ -53,7 +53,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     struct timeval rtc_now;
     gettimeofday(&rtc_now, NULL);
 
-    // We may have spent some number of millis waiting for gps data to be read.
+    // We may have spent some time waiting for gps data to be read.
     // microsAfterRTC will allow us to account for this.
     int64_t microsAfterRTC = esp_timer_get_time();
 
@@ -68,9 +68,9 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
     wt.tm_sec = gps->time.second();
     time_t gpsDateAndTime = mktime(&wt);
 
-    // At this point we have the pps rise time in micros as well as the corresponding GPS time.
-    // We also know our RTC time and when we took it, in micros.
-    time_t updateDeltaSecs = gpsDateAndTime - rtc_now.tv_sec;
+    // Compute the RTC error. If local time is ahead of GPS time, this will be >= 0.
+    // Note that 0 can also be the case if we're behind, as we waited for NMEA data.
+    time_t rtcErrorSecs = rtc_now.tv_sec - gpsDateAndTime;
 
     // avoid changing date/time while an NTP request is being answered
     if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
@@ -81,7 +81,7 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
       }
 
       // set the real time clock, accounting for the extra time that passed since we saw the PPS pulse
-      rtc->setTime(gpsDateAndTime, (esp_timer_get_time() - thisPpsRiseMicros) / 1000);
+      rtc->setTime(gpsDateAndTime, esp_timer_get_time() - thisPpsRiseMicros);
 
       // release the hold
       xSemaphoreGive(mutex);
@@ -105,21 +105,10 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
 
         // clock error in microseconds, accounting for time taken to measure the RTC time
         int64_t microsBetweenPulseAndRTCMeasurement = microsAfterRTC - thisPpsRiseMicros;
-        time_t errorMicros = (updateDeltaSecs * 1e6) - (rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement);
+        time_t errorMicros = (rtcErrorSecs * 1e6) + rtc_now.tv_usec - microsBetweenPulseAndRTCMeasurement;
 
         // how close was the previous drift adjustment?
-        lastErrorMicros = errorMicros - microsBetweenAdjustments * driftEstimate;
-
-        // Pre-compute fixed-point format for use in the NTP message
-        if (state == TimeServerState::SERVING_NTP || driftCalc.hasMaxSamples()) {
-
-          if (abs(lastErrorMicros) > maxObservedErrorMicros) {
-            maxObservedErrorMicros = abs(lastErrorMicros);
-
-            // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
-            rootDispersion = static_cast<uint32_t>(std::ceil(abs(lastErrorMicros) * 1e-6 * (1 << 16)));
-          }
-        }
+        lastAdjustedErrorMicros = errorMicros - microsBetweenAdjustments * driftEstimate;
 
         // Update our drift measurement. As we only have microsecond resolution timers,
         // we want to do some kind of regression as a single microsecond is 0.1ppm drift
@@ -128,18 +117,34 @@ void TimeServer::setDateAndTimeFromGPS(ESP32Time *rtc, TinyGPSPlus *gps) {
         driftCalc.addSample(microsBetweenAdjustments, errorMicros);
         driftEstimate = driftCalc.getDrift();
 
+        // Pre-compute fixed-point format for use in the NTP message
+        if (state == TimeServerState::SERVING_NTP || driftCalc.hasMaxSamples()) {
+
+          if (abs(lastAdjustedErrorMicros) > maxObservedErrorMicros) {
+            maxObservedErrorMicros = abs(lastAdjustedErrorMicros);
+
+            // convert to seconds, left shift for fixed point representation, ceil so the error we report is >= observed
+            rootDispersion = static_cast<uint32_t>(std::ceil(abs(lastAdjustedErrorMicros) * 1e-6 * (1 << 16)));
+          }
+        }
+
         // we keep this for debugging purposes
         lastClockDrift = (double)errorMicros / (double)microsBetweenAdjustments;
         
         if (debugIsOn) {
-          Serial.println("Adjusted the clock by adding " + String(updateDeltaSecs) + "s (" + String(errorMicros) + "us)");
+          Serial.println("Adjusted the clock by adding " + String(rtcErrorSecs) + "s (" + String(errorMicros) + "us)");
           Serial.print(microsBetweenAdjustments);
           Serial.print("us passed between adjustments. Clock drift is ");
           Serial.print(lastClockDrift * 1e6);
           Serial.print("ppm. Drift regression suggests " + String(driftEstimate * 1e6) + "ppm.");
           Serial.println("ppm.");
 
-          Serial.println("When adjusting for drift we had a cumulative error of " + String(lastErrorMicros) + "us.");
+          Serial.println("When adjusting for drift we had a cumulative error of " + String(lastAdjustedErrorMicros) + "us.");
+        }
+
+        if (driftCalc.hasMaxSamples()) {
+          // we have enough samples to be confident in our drift estimate
+          state = TimeServerState::SERVING_NTP;
         }
 
       } else {

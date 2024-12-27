@@ -14,7 +14,7 @@ const int pinDisplayScl = 14; // Display SCL connected to GPIO14
 void drawCentered(const char *line);
 
 void displayInit();
-void displayAcquiring(TinyGPSSatellites &satellitesStats);
+void displayAcquiring(TimeServerState state, TinyGPSSatellites &satellitesStats);
 void displayInfo(TimeServer &timeServer, ESP32Time &rtc, TinyGPSPlus &gps);
 String getUptime();
 

@@ -35,7 +35,7 @@ public:
 
     volatile int64_t maxAdjustmentGapMicros = 0;
     volatile int64_t lastAdjustmentPpsRiseMicros = 0;
-    volatile int64_t lastErrorMicros = 0;
+    volatile int64_t lastAdjustedErrorMicros = 0;
     volatile int64_t maxObservedErrorMicros = 0;
     // pre-computed fixed-point value used as part of the NTP message
     volatile uint32_t rootDispersion = 0;
